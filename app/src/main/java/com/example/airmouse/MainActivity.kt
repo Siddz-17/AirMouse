@@ -30,8 +30,8 @@ import kotlin.math.*
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        const val APP_VERSION_CODE = 11
-        const val APP_VERSION_NAME = "2.9"
+        const val APP_VERSION_CODE = 12
+        const val APP_VERSION_NAME = "3.0"
 
         const val MODE_AIR = 0
         const val MODE_SURFACE = 1
@@ -47,14 +47,17 @@ class MainActivity : Activity(), SensorEventListener {
     private var biasH = 0f
     private var biasV = 0f
 
-    // Surface Mode Parameters (DC-blocking impulse physics — zero drift)
-    private var surfaceHpX = 0f
-    private var surfaceHpY = 0f
-    private var prevRawAx = 0f
-    private var prevRawAy = 0f
-    private var lastLinearTs = 0L
-    private val surfaceImpulseGain = 55f
-    private val surfaceDeadzone = 0.18f // m/s^2
+    // Surface Mode Parameters (Dual-Engine: Gyro Swivel/Pitch + Linear Push Impulse)
+    private var surfaceBiasH = 0f
+    private var surfaceBiasV = 0f
+    private var surfaceBiasAx = 0f
+    private var surfaceBiasAy = 0f
+    private var lastSurfaceGyroTs = 0L
+    private var lastSurfaceLinearTs = 0L
+    private val surfaceGyroGain = 1400f
+    private val surfaceAccelGain = 1200f
+    private val surfaceGyroDeadzone = 0.020f // rad/s
+    private val surfaceAccelDeadzone = 0.045f // m/s^2
 
     // Motion State & Smoothing
     private var smoothH = 0f
@@ -695,7 +698,10 @@ class MainActivity : Activity(), SensorEventListener {
         touchpadContainer.visibility = if (currentMode == MODE_TOUCHPAD) View.VISIBLE else View.GONE
 
         smoothH = 0f; smoothV = 0f
-        surfaceHpX = 0f; surfaceHpY = 0f
+        surfaceBiasH = 0f; surfaceBiasV = 0f
+        surfaceBiasAx = 0f; surfaceBiasAy = 0f
+        lastSurfaceGyroTs = 0L
+        lastSurfaceLinearTs = 0L
         lastYaw = Float.NaN; lastPitch = Float.NaN
 
         modeBadge.text = when (currentMode) {
@@ -902,11 +908,12 @@ class MainActivity : Activity(), SensorEventListener {
         if (!connected || currentMode == MODE_TOUCHPAD || gyroPaused) return
 
         if (currentMode == MODE_SURFACE) {
-            if (e.sensor.type == Sensor.TYPE_LINEAR_ACCELERATION || e.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-                activeSensorName = "DESK_SURFACE"
+            if (e.sensor.type == Sensor.TYPE_GYROSCOPE) {
+                activeSensorName = "SURFACE_GYRO"
+                handleSurfaceGyro(e)
+            } else if (e.sensor.type == Sensor.TYPE_LINEAR_ACCELERATION || e.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+                activeSensorName = "SURFACE_ACCEL"
                 handleSurfaceLinearAccelEvent(e)
-            } else if (e.sensor.type == Sensor.TYPE_GYROSCOPE) {
-                handleSurfaceYawAssist(e)
             }
             return
         }
@@ -923,48 +930,81 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
+    private fun handleSurfaceGyro(e: SensorEvent) {
+        val now = e.timestamp
+        if (lastSurfaceGyroTs == 0L) { lastSurfaceGyroTs = now; return }
+        val dt = ((now - lastSurfaceGyroTs) / 1e9f).coerceIn(0.001f, 0.04f)
+        lastSurfaceGyroTs = now
+
+        // Swivel/yaw around Z on table gives Left/Right
+        val rawH = -e.values[2]
+        // Rocking/pitch around X on table gives Up/Down
+        // Pushing forward tilts top down (e.values[0] > 0), so -e.values[0] produces negative dy (UP on Windows)
+        val rawV = -e.values[0]
+
+        // Dynamic auto-zero bias rejection for surface mode
+        if (hypot(rawH, rawV) < 0.035f) {
+            surfaceBiasH = 0.96f * surfaceBiasH + 0.04f * rawH
+            surfaceBiasV = 0.96f * surfaceBiasV + 0.04f * rawV
+        }
+
+        val noBiasH = rawH - surfaceBiasH
+        val noBiasV = rawV - surfaceBiasV
+
+        val inH = if (abs(noBiasH) < surfaceGyroDeadzone) 0f else (noBiasH - sign(noBiasH) * surfaceGyroDeadzone)
+        val inV = if (abs(noBiasV) < surfaceGyroDeadzone) 0f else (noBiasV - sign(noBiasV) * surfaceGyroDeadzone)
+
+        if (abs(inH) > 0f || abs(inV) > 0f) {
+            val mult = surfaceGyroGain * currentSensitivity
+            val dx = (inH * dt * mult).toDouble()
+            val dy = (inV * dt * mult).toDouble()
+            sendSurfaceDelta(dx, dy)
+        }
+    }
+
     private fun handleSurfaceLinearAccelEvent(e: SensorEvent) {
         val now = e.timestamp
-        if (lastLinearTs == 0L) {
-            lastLinearTs = now
-            prevRawAx = e.values[0]
-            prevRawAy = e.values[1]
+        if (lastSurfaceLinearTs == 0L) {
+            lastSurfaceLinearTs = now
+            surfaceBiasAx = e.values[0]
+            surfaceBiasAy = e.values[1]
             return
         }
-        val dt = ((now - lastLinearTs) / 1e9f).coerceIn(0.001f, 0.04f)
-        lastLinearTs = now
+        val dt = ((now - lastSurfaceLinearTs) / 1e9f).coerceIn(0.001f, 0.04f)
+        lastSurfaceLinearTs = now
 
         val rawAx = e.values[0]
         val rawAy = e.values[1]
 
-        // DC-blocking high-pass filter: eliminates any gravity tilt bias completely!
-        surfaceHpX = 0.85f * (surfaceHpX + rawAx - prevRawAx)
-        surfaceHpY = 0.85f * (surfaceHpY + rawAy - prevRawAy)
-        prevRawAx = rawAx
-        prevRawAy = rawAy
+        // Dynamic auto-zero bias rejection:
+        // When resting flat or steady on table, track table tilt and gravity bias!
+        if (hypot(rawAx - surfaceBiasAx, rawAy - surfaceBiasAy) < 0.07f) {
+            surfaceBiasAx = 0.96f * surfaceBiasAx + 0.04f * rawAx
+            surfaceBiasAy = 0.96f * surfaceBiasAy + 0.04f * rawAy
+        }
 
-        val cleanAx = if (abs(surfaceHpX) < surfaceDeadzone) 0f else (surfaceHpX - sign(surfaceHpX) * surfaceDeadzone)
-        val cleanAy = if (abs(surfaceHpY) < surfaceDeadzone) 0f else (surfaceHpY - sign(surfaceHpY) * surfaceDeadzone)
+        val cleanAx = rawAx - surfaceBiasAx
+        val cleanAy = rawAy - surfaceBiasAy
 
-        val mag = hypot(cleanAx, cleanAy)
-        if (mag > 0.02f) {
-            val impulse = min(1.8f, (mag / 0.8f).pow(1.1f))
-            val dx = (cleanAx * dt * surfaceImpulseGain * currentSensitivity * impulse).toDouble()
-            // Forward push on table (positive Ay) moves cursor UP (-dy on Windows)
-            val dy = (-cleanAy * dt * surfaceImpulseGain * currentSensitivity * impulse).toDouble()
+        val inAx = if (abs(cleanAx) < surfaceAccelDeadzone) 0f else (cleanAx - sign(cleanAx) * surfaceAccelDeadzone)
+        val inAy = if (abs(cleanAy) < surfaceAccelDeadzone) 0f else (cleanAy - sign(cleanAy) * surfaceAccelDeadzone)
 
-            lastSentDx = dx.toFloat()
-            lastSentDy = dy.toFloat()
-            sendRaw("m ${"%.3f".format(Locale.US, dx)} ${"%.3f".format(Locale.US, dy)}")
+        if (abs(inAx) > 0f || abs(inAy) > 0f) {
+            // Linear acceleration impulse:
+            // Pushing forward (+Ay) moves cursor UP (-dy on Windows)
+            // Pushing right (+Ax) moves cursor RIGHT (+dx on Windows)
+            val mult = surfaceAccelGain * currentSensitivity
+            val dx = (inAx * dt * mult).toDouble()
+            val dy = (-inAy * dt * mult).toDouble()
+            sendSurfaceDelta(dx, dy)
         }
     }
 
-    private fun handleSurfaceYawAssist(e: SensorEvent) {
-        // When swiveling/pivoting phone on desk, add smooth horizontal delta
-        val yawOmega = -e.values[2]
-        if (abs(yawOmega) > 0.08f) {
-            val dx = (yawOmega * 0.005f * 1000f * currentSensitivity).toDouble()
-            sendRaw("m ${"%.3f".format(Locale.US, dx)} 0.000")
+    private fun sendSurfaceDelta(dx: Double, dy: Double) {
+        if (abs(dx) > 0.005 || abs(dy) > 0.005) {
+            lastSentDx = dx.toFloat()
+            lastSentDy = dy.toFloat()
+            sendRaw("m ${"%.3f".format(Locale.US, dx)} ${"%.3f".format(Locale.US, dy)}")
         }
     }
 
@@ -975,7 +1015,7 @@ class MainActivity : Activity(), SensorEventListener {
         lastGyroTs = now
 
         val rawH = -(e.values[2] + e.values[1])
-        val rawV = -e.values[0]
+        val rawV = e.values[0]
 
         // Dynamic auto-zero bias rejection:
         // Adaptively cancels slow hardware creep when steady
@@ -1001,7 +1041,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         if (gyroScrolling) {
             if (abs(smoothV) > 0.004f) {
-                val scrollDy = (smoothV * dt * gyroScrollPerRad * currentSensitivity).toDouble()
+                val scrollDy = (-smoothV * dt * gyroScrollPerRad * currentSensitivity).toDouble()
                 sendRaw("s ${"%.3f".format(Locale.US, scrollDy)}")
             }
         } else {
