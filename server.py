@@ -8,7 +8,7 @@ import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import websockets
 
-CURRENT_VERSION_CODE = 12
+CURRENT_VERSION_CODE = 20
 CURRENT_VERSION_NAME = "3.0"
 
 # Ensure unbuffered console output
@@ -201,8 +201,9 @@ async def handler(websocket):
     })
     try:
         await websocket.send(init_payload)
-    except Exception:
-        pass
+        print(f"[OTA] Sent init to phone: {init_payload}", flush=True)
+    except Exception as e:
+        print(f"[!] Failed to send init: {e}", flush=True)
 
     try:
         async for raw in websocket:
