@@ -2,8 +2,14 @@ import asyncio
 import json
 import ctypes
 import sys
+import os
 import socket
+import threading
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import websockets
+
+CURRENT_VERSION_CODE = 2
+CURRENT_VERSION_NAME = "2.0"
 
 # Ensure unbuffered console output
 sys.stdout.reconfigure(line_buffering=True)
@@ -80,9 +86,55 @@ def on_up(button):
     if button == "left":
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
+# ==========================================
+# OTA HTTP UPDATE SERVER (PORT 8081)
+# ==========================================
+class OTAHandler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        apk_path = os.path.join(base_dir, "build-artifacts", "AirMouse-apk", "app-debug.apk")
+
+        if self.path in ("/AirMouse.apk", "/app-debug.apk"):
+            if os.path.exists(apk_path):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.android.package-archive")
+                self.send_header("Content-Disposition", 'attachment; filename="AirMouse.apk"')
+                self.send_header("Content-Length", str(os.path.getsize(apk_path)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                with open(apk_path, "rb") as f:
+                    self.wfile.write(f.read())
+                print(f"[OTA] Delivered AirMouse.apk ({os.path.getsize(apk_path)} bytes) to phone", flush=True)
+                return
+            else:
+                self.send_error(404, "APK artifact not found on server")
+                return
+
+        elif self.path == "/version":
+            data = json.dumps({"versionCode": CURRENT_VERSION_CODE, "versionName": CURRENT_VERSION_NAME}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        self.send_error(404, "Not Found")
+
+    def log_message(self, format, *args):
+        # suppress default verbose GET logging
+        pass
+
+def run_http_ota(port=8081):
+    server = ThreadingHTTPServer(("0.0.0.0", port), OTAHandler)
+    server.serve_forever()
+
+# ==========================================
+# WEBSOCKET ENGINE (PORT 8080)
+# ==========================================
 async def handler(websocket):
     attach_to_default_desktop()
-    # Enable TCP_NODELAY for lowest possible ping over Wi-Fi
+
     try:
         sock = websocket.transport.get_extra_info("socket")
         if sock:
@@ -93,6 +145,30 @@ async def handler(websocket):
     client_ip = websocket.remote_address[0]
     cx, cy = get_cursor_pos()
     print(f"\n[+] Phone connected from: {client_ip} | Cursor at: ({cx}, {cy})", flush=True)
+
+    # Determine server host IP reachable by phone
+    server_ip = "192.168.0.107"
+    try:
+        # Get interface IP matching connection
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((client_ip, 80))
+        server_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+
+    # Send Version & OTA payload to client
+    init_payload = json.dumps({
+        "t": "init",
+        "versionCode": CURRENT_VERSION_CODE,
+        "versionName": CURRENT_VERSION_NAME,
+        "apkUrl": f"http://{server_ip}:8081/AirMouse.apk"
+    })
+    try:
+        await websocket.send(init_payload)
+    except Exception:
+        pass
+
     try:
         async for raw in websocket:
             try:
@@ -117,15 +193,23 @@ async def handler(websocket):
 
 async def main():
     attach_to_default_desktop()
-    port = 8080
-    host = "0.0.0.0"
+    ws_port = 8080
+    ota_port = 8081
+
+    # Start OTA HTTP server thread
+    ota_thread = threading.Thread(target=run_http_ota, args=(ota_port,), daemon=True)
+    ota_thread.start()
+
     cx, cy = get_cursor_pos()
-    print("=" * 60, flush=True)
-    print(f"AirMouse Ultra-Low Latency Server on ws://0.0.0.0:{port}", flush=True)
-    print(f"Connected to Windows desktop. Current cursor: ({cx}, {cy})", flush=True)
-    print("Waiting for phone to connect...", flush=True)
-    print("=" * 60, flush=True)
-    async with websockets.serve(handler, host, port, ping_interval=None, ping_timeout=None):
+    print("=" * 65, flush=True)
+    print(f"AirMouse Cyber Hybrid Server v{CURRENT_VERSION_NAME}", flush=True)
+    print(f"  ● Input WebSocket   : ws://0.0.0.0:{ws_port}", flush=True)
+    print(f"  ● In-App OTA Flash  : http://0.0.0.0:{ota_port}/AirMouse.apk", flush=True)
+    print(f"  ● Connected Desktop : Interactive (Cursor: {cx}, {cy})", flush=True)
+    print("Waiting for phone connection...", flush=True)
+    print("=" * 65, flush=True)
+
+    async with websockets.serve(handler, "0.0.0.0", ws_port, ping_interval=None, ping_timeout=None):
         await asyncio.Future()
 
 if __name__ == "__main__":
