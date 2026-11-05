@@ -30,71 +30,37 @@ import kotlin.math.*
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        const val APP_VERSION_CODE = 7
-        const val APP_VERSION_NAME = "2.5"
+        const val APP_VERSION_CODE = 8
+        const val APP_VERSION_NAME = "2.6"
     }
-
-    // =========================================================================
-    // 1€ FILTER (Casiez et al.) — Rock-solid stability when still, zero lag on flicks
-    // =========================================================================
-    private inner class OneEuroFilter(
-        private val minCutoff: Float = 0.85f, // Hz: Heavy damping below 0.85 Hz removes hand tremor
-        private val beta: Float = 0.02f,       // Low beta ensures jitter does not leak into motion
-        private val dCutoff: Float = 1.0f      // Derivative filter cutoff Hz
-    ) {
-        private var xPrev: Float? = null
-        private var dxPrev = 0f
-        private var tPrev = 0L
-
-        private fun alpha(cutoff: Float, dt: Float): Float {
-            val tau = 1f / (2f * PI.toFloat() * cutoff)
-            return 1f / (1f + tau / dt)
-        }
-
-        fun filter(x: Float, timestamp: Long): Float {
-            if (xPrev == null) {
-                xPrev = x; tPrev = timestamp; return x
-            }
-            val dt = ((timestamp - tPrev) / 1e9f).coerceIn(0.001f, 0.05f)
-            tPrev = timestamp
-
-            // Filter the derivative (speed of motion)
-            val dx = (x - xPrev!!) / dt
-            val aD = alpha(dCutoff, dt)
-            val dxHat = aD * dx + (1f - aD) * dxPrev
-            dxPrev = dxHat
-
-            // Dynamically adjust cutoff: Still = minCutoff (smooth), Fast = higher (responsive)
-            val cutoff = minCutoff + beta * abs(dxHat)
-            val a = alpha(cutoff, dt)
-            val xHat = a * x + (1f - a) * xPrev!!
-            xPrev = xHat
-            return xHat
-        }
-
-        fun reset() {
-            xPrev = null
-            dxPrev = 0f
-            tPrev = 0L
-        }
-    }
-
-    private val filterH = OneEuroFilter(minCutoff = 0.85f, beta = 0.020f)
-    private val filterV = OneEuroFilter(minCutoff = 0.85f, beta = 0.020f)
 
     // Motion parameters
-    private val gyroPxPerRad = 2200f
-    private val gyroScrollPerRad = 50f
-    private val deadzoneThreshold = 0.010f // rad/s
+    private val gyroPxPerRad = 3600f
+    private val gyroScrollPerRad = 60f
+    private val deadzoneThreshold = 0.006f // rad/s (kills MEMS resting noise)
 
-    // Gravity vector for 3D tilt compensation
-    private var gravX = 0.0f
-    private var gravY = 7.0f
-    private var gravZ = 7.0f
-
+    // Motion State & Smoothing
+    private var smoothH = 0f
+    private var smoothV = 0f
     private var lastGyroTs = 0L
+
+    // Rotation Vector Fallback State
+    private var lastYaw = Float.NaN
+    private var lastPitch = Float.NaN
+    private val rotMatrix = FloatArray(9)
+    private val orientationVals = FloatArray(3)
+
     private var currentSensitivity = 1.0f
     private var isTouchpadMode = false
+
+    // Sensor Diagnostics & Rate Counters
+    private var activeSensorName = "INITIALIZING..."
+    private var sensorEventCount = 0
+    private var lastRateCalcTime = 0L
+    private var currentSensorHz = 0
+    private var totalPacketsSent = 0L
+    private var lastSentDx = 0f
+    private var lastSentDy = 0f
 
     // Network & Wi-Fi Lock
     private val client = OkHttpClient.Builder().pingInterval(10, TimeUnit.SECONDS).build()
@@ -117,6 +83,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var gyroTabBtn: TextView
     private lateinit var touchpadTabBtn: TextView
     private lateinit var modeBadge: TextView
+    private lateinit var diagnosticHud: TextView
 
     @Volatile private var connected = false
     @Volatile private var gyroScrolling = false
@@ -255,7 +222,7 @@ class MainActivity : Activity(), SensorEventListener {
             setPadding(0, 0, 0, dp(6))
         }
         val dotMatrixSubtitle = TextView(this).apply {
-            text = "OPTICAL 1€ ENGINE V$APP_VERSION_NAME • 200HZ"
+            text = "DUAL-ENGINE OPTICAL V$APP_VERSION_NAME • 200HZ"
             setTextColor(Color.parseColor("#666666"))
             typeface = Typeface.MONOSPACE
             textSize = 11f
@@ -352,13 +319,24 @@ class MainActivity : Activity(), SensorEventListener {
         modeSwitcher.addView(touchpadTabBtn)
         mainHubView.addView(modeSwitcher)
 
+        // Live Diagnostic Widget
+        diagnosticHud = TextView(this).apply {
+            text = "SENSOR: INITIALIZING... | 0 HZ"
+            setTextColor(Color.parseColor("#22C55E")) // Green terminal text
+            typeface = Typeface.MONOSPACE
+            textSize = 10f
+            gravity = Gravity.CENTER
+            setPadding(0, dp(2), 0, dp(2))
+        }
+        mainHubView.addView(diagnosticHud)
+
         modeBadge = TextView(this).apply {
-            text = "• 3D ORIENTATION + 1€ FILTER ACTIVE  |  VOL KEYS: CLICK"
+            text = "• ACTIVE AIR MOUSE  |  VOL KEYS: CLICK"
             setTextColor(Color.parseColor("#888888"))
             typeface = Typeface.MONOSPACE
             textSize = 10f
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(8))
+            setPadding(0, 0, 0, dp(6))
         }
         mainHubView.addView(modeBadge)
 
@@ -372,10 +350,10 @@ class MainActivity : Activity(), SensorEventListener {
         // Sensitivity Control
         val sliderCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             background = nothingCard(Color.parseColor("#111111"), Color.parseColor("#222222"), dp(16))
             layoutParams = LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(8)
+                topMargin = dp(6)
             }
         }
         val sensTitle = TextView(this).apply {
@@ -386,11 +364,11 @@ class MainActivity : Activity(), SensorEventListener {
             gravity = Gravity.CENTER
         }
         val sensBar = SeekBar(this).apply {
-            max = 200
-            progress = ((currentSensitivity - 0.5f) / 2.0f * 200).toInt().coerceIn(0, 200)
+            max = 250
+            progress = ((currentSensitivity - 0.5f) / 2.5f * 250).toInt().coerceIn(0, 250)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    currentSensitivity = 0.5f + (p / 200f) * 2.0f
+                    currentSensitivity = 0.5f + (p / 250f) * 2.5f
                     sensTitle.text = "SENSITIVITY // ${"%.1f".format(currentSensitivity)}X"
                     prefs.edit().putFloat("sensitivity", currentSensitivity).apply()
                 }
@@ -405,6 +383,23 @@ class MainActivity : Activity(), SensorEventListener {
         root.addView(mainHubView)
         setContentView(root)
         updateTabStyles()
+
+        // Periodically refresh live diagnostics HUD
+        ui.post(object : Runnable {
+            override fun run() {
+                val now = SystemClock.uptimeMillis()
+                val dt = (now - lastRateCalcTime) / 1000f
+                if (dt >= 1.0f) {
+                    currentSensorHz = (sensorEventCount / dt).toInt()
+                    sensorEventCount = 0
+                    lastRateCalcTime = now
+                }
+                if (connected && mainHubView.visibility == View.VISIBLE) {
+                    diagnosticHud.text = "$activeSensorName @ ${currentSensorHz}Hz | dX:${"%.1f".format(lastSentDx)} dY:${"%.1f".format(lastSentDy)} | PKTS:$totalPacketsSent"
+                }
+                ui.postDelayed(this, 300)
+            }
+        })
     }
 
     // ==========================================
@@ -504,15 +499,15 @@ class MainActivity : Activity(), SensorEventListener {
                 MotionEvent.ACTION_MOVE -> {
                     if (isTwoFinger && pCount >= 2) {
                         val currentScrollY = (event.getY(0) + event.getY(1)) / 2f
-                        val dy = (currentScrollY - prevScrollY) * 0.14f * currentSensitivity
+                        val dy = (currentScrollY - prevScrollY) * 0.16f * currentSensitivity
                         prevScrollY = currentScrollY
                         if (abs(dy) > 0.05f) sendRaw("s ${"%.3f".format(Locale.US, dy)}")
                     } else if (!isTwoFinger && pCount == 1) {
-                        val rawDx = (event.x - prevX) * 1.6f * currentSensitivity
-                        val rawDy = (event.y - prevY) * 1.6f * currentSensitivity
+                        val rawDx = (event.x - prevX) * 1.8f * currentSensitivity
+                        val rawDy = (event.y - prevY) * 1.8f * currentSensitivity
                         prevX = event.x; prevY = event.y
                         val dist = hypot(rawDx, rawDy)
-                        val accel = (0.85f + 1.2f * min(1.0f, dist / 20f))
+                        val accel = (0.85f + 1.3f * min(1.0f, dist / 20f))
                         val dx = rawDx * accel
                         val dy = rawDy * accel
                         if (abs(dx) > 0.01f || abs(dy) > 0.01f) {
@@ -568,8 +563,9 @@ class MainActivity : Activity(), SensorEventListener {
         } else {
             touchpadContainer.visibility = View.GONE
             gyroContainer.visibility = View.VISIBLE
-            modeBadge.text = "• 3D ORIENTATION + 1€ FILTER ACTIVE  |  VOL KEYS: CLICK"
-            filterH.reset(); filterV.reset()
+            modeBadge.text = "• ACTIVE AIR MOUSE  |  VOL KEYS: CLICK"
+            smoothH = 0f; smoothV = 0f
+            lastYaw = Float.NaN; lastPitch = Float.NaN
         }
         updateTabStyles()
     }
@@ -617,7 +613,8 @@ class MainActivity : Activity(), SensorEventListener {
             override fun onOpen(w: WebSocket, r: Response) = runOnUiThread {
                 connected = true
                 lastGyroTs = 0L
-                filterH.reset(); filterV.reset()
+                smoothH = 0f; smoothV = 0f
+                lastYaw = Float.NaN; lastPitch = Float.NaN
                 acquireWifiLock()
                 haptic(50)
                 statusDot.setTextColor(Color.parseColor("#22C55E"))
@@ -761,76 +758,102 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // OPTICAL MOTION ENGINE: 3D ORIENTATION + 1€ FILTER
+    // DUAL SENSOR PIPELINE: GYROSCOPE + ROTATION VECTOR FUSION
     // ==========================================
-    private fun softDeadzone(v: Float, threshold: Float): Float {
-        val a = abs(v)
-        if (a <= threshold) return 0f
-        // Smoothstep ramp from threshold to 2.5 * threshold
-        val t = ((a - threshold) / (1.5f * threshold)).coerceIn(0f, 1f)
-        val smooth = t * t * (3f - 2f * t)
-        return (v / a) * (a - threshold) * smooth
+    override fun onSensorChanged(e: SensorEvent) {
+        sensorEventCount++
+        if (!connected || isTouchpadMode || gyroPaused) return
+
+        if (e.sensor.type == Sensor.TYPE_GYROSCOPE) {
+            activeSensorName = "GYRO"
+            handleGyroscopeEvent(e)
+        } else if (e.sensor.type == Sensor.TYPE_GAME_ROTATION_VECTOR || e.sensor.type == Sensor.TYPE_ROTATION_VECTOR) {
+            // Only use rotation vector if gyroscope is not currently delivering
+            if (activeSensorName != "GYRO") {
+                activeSensorName = "FUSION_VEC"
+                handleRotationVectorEvent(e)
+            }
+        }
     }
 
-    override fun onSensorChanged(e: SensorEvent) {
-        // Track gravity vector to project hand motion onto true world horizontal/vertical
-        if (e.sensor.type == Sensor.TYPE_GRAVITY || e.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-            gravX = 0.90f * gravX + 0.10f * e.values[0]
-            gravY = 0.90f * gravY + 0.10f * e.values[1]
-            gravZ = 0.90f * gravZ + 0.10f * e.values[2]
-            return
-        }
-
-        if (e.sensor.type != Sensor.TYPE_GYROSCOPE) return
-        if (!connected || isTouchpadMode) return
-
+    private fun handleGyroscopeEvent(e: SensorEvent) {
         val now = e.timestamp
         if (lastGyroTs == 0L) { lastGyroTs = now; return }
         val dt = ((now - lastGyroTs) / 1e9f).coerceIn(0.001f, 0.04f)
         lastGyroTs = now
-        if (gyroPaused) return
 
-        // 3D Tilt Compensation:
-        // When holding the phone flat, horizontal rotation comes from Z.
-        // When holding the phone upright, horizontal rotation comes from Y.
-        // Both Y and Z contribute constructively!
-        val denom = max(0.1f, hypot(gravY, gravZ))
-        val cosTilt = (gravZ / denom).coerceIn(-1f, 1f)
-        val sinTilt = (gravY / denom).coerceIn(-1f, 1f)
+        // Direct, robust 3D rotation projection:
+        // Turning left/right (yaw) causes rotation around Z (wrist/pointing) and Y (panning).
+        // Summing them gives instant responsive horizontal tracking at any hand inclination.
+        val rawH = -(e.values[2] + e.values[1])
 
-        // Raw Horizontal Angular Velocity (constructive yaw)
-        // Turning left produces positive gyro readings; we want negative dx (cursor moves left).
-        val rawH = -(e.values[1] * sinTilt + e.values[2] * cosTilt)
+        // Tilting UP (top goes towards user) produces negative values[0];
+        // Windows cursor UP is negative dy.
+        val rawV = -e.values[0]
 
-        // Raw Vertical Angular Velocity (pitch)
-        // Tilting UP (top rotates back/up) produces negative values[0]; we want negative dy (cursor moves up).
-        val rawV = e.values[0]
+        // Deadzone: remove resting physiological hand tremor
+        val magH = abs(rawH)
+        val magV = abs(rawV)
+        val inH = if (magH < deadzoneThreshold) 0f else (rawH - sign(rawH) * deadzoneThreshold)
+        val inV = if (magV < deadzoneThreshold) 0f else (rawV - sign(rawV) * deadzoneThreshold)
 
-        // Smooth continuous deadzone removes MEMS sensor noise and resting hand tremor
-        val cleanH = softDeadzone(rawH, deadzoneThreshold)
-        val cleanV = softDeadzone(rawV, deadzoneThreshold)
-
-        // One-Euro adaptive filter: Rock steady when still, zero lag on flicks
-        val filtH = filterH.filter(cleanH, now)
-        val filtV = filterV.filter(cleanV, now)
+        // Low-latency exponential smoothing filter (alpha = 0.65 -> <8ms response)
+        val speed = hypot(inH, inV)
+        val alpha = (0.50f + 0.35f * min(1.0f, speed / 0.5f)).coerceIn(0.40f, 0.85f)
+        smoothH += alpha * (inH - smoothH)
+        smoothV += alpha * (inV - smoothV)
 
         if (gyroScrolling) {
-            if (abs(filtV) > 0.005f) {
-                val scrollDy = (filtV * dt * gyroScrollPerRad * currentSensitivity).toDouble()
+            if (abs(smoothV) > 0.004f) {
+                val scrollDy = (smoothV * dt * gyroScrollPerRad * currentSensitivity).toDouble()
                 sendRaw("s ${"%.3f".format(Locale.US, scrollDy)}")
             }
         } else {
-            val speed = hypot(filtH, filtV)
-            if (speed > 0.003f) {
-                // Optical Mouse Ballistics (True mouse acceleration curve)
-                val accel = (0.90f + 1.8f * min(1.0f, (speed / 1.5f).pow(1.3f))).coerceIn(0.85f, 3.0f)
+            val smoothSpeed = hypot(smoothH, smoothV)
+            if (smoothSpeed > 0.002f) {
+                // Natural mouse ballistics curve
+                val accel = (0.90f + 1.6f * min(1.0f, (smoothSpeed / 1.2f).pow(1.2f))).coerceIn(0.90f, 2.8f)
                 val mult = gyroPxPerRad * currentSensitivity * accel
 
-                val dx = (filtH * dt * mult).toDouble()
-                val dy = (filtV * dt * mult).toDouble()
+                val dx = (smoothH * dt * mult).toDouble()
+                val dy = (smoothV * dt * mult).toDouble()
 
+                lastSentDx = dx.toFloat()
+                lastSentDy = dy.toFloat()
                 sendRaw("m ${"%.3f".format(Locale.US, dx)} ${"%.3f".format(Locale.US, dy)}")
             }
+        }
+    }
+
+    private fun handleRotationVectorEvent(e: SensorEvent) {
+        SensorManager.getRotationMatrixFromVector(rotMatrix, e.values)
+        SensorManager.getOrientation(rotMatrix, orientationVals)
+
+        val yaw = orientationVals[0]   // azimuth [-pi, pi]
+        val pitch = orientationVals[1] // pitch [-pi/2, pi/2]
+
+        if (lastYaw.isNaN() || lastPitch.isNaN()) {
+            lastYaw = yaw
+            lastPitch = pitch
+            return
+        }
+
+        var dYaw = yaw - lastYaw
+        if (dYaw > PI.toFloat()) dYaw -= (2f * PI.toFloat())
+        if (dYaw < -PI.toFloat()) dYaw += (2f * PI.toFloat())
+
+        val dPitch = pitch - lastPitch
+        lastYaw = yaw
+        lastPitch = pitch
+
+        if (abs(dYaw) > 0.0003f || abs(dPitch) > 0.0003f) {
+            val mult = gyroPxPerRad * currentSensitivity * 1.2f
+            val dx = (-dYaw * mult).toDouble()
+            val dy = (-dPitch * mult).toDouble()
+
+            lastSentDx = dx.toFloat()
+            lastSentDy = dy.toFloat()
+            sendRaw("m ${"%.3f".format(Locale.US, dx)} ${"%.3f".format(Locale.US, dy)}")
         }
     }
 
@@ -840,17 +863,26 @@ class MainActivity : Activity(), SensorEventListener {
         super.onResume()
         try {
             val sensorManager = sm ?: return
+
+            // 1. Register Gyroscope at fastest speed
             val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
             if (gyro != null) {
                 sensorManager.registerListener(this, gyro, SensorManager.SENSOR_DELAY_FASTEST)
-            } else if (!isTouchpadMode) {
-                switchMode(true)
-                modeBadge.text = "• NO GYRO SENSOR - TOUCHPAD ACTIVE"
+                activeSensorName = "GYRO"
             }
-            val grav = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
-                ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-            if (grav != null) {
-                sensorManager.registerListener(this, grav, SensorManager.SENSOR_DELAY_GAME)
+
+            // 2. Register Game Rotation Vector (6-DOF sensor fusion)
+            val gameRot = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+                ?: sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+            if (gameRot != null) {
+                sensorManager.registerListener(this, gameRot, SensorManager.SENSOR_DELAY_FASTEST)
+                if (gyro == null) activeSensorName = "FUSION_VEC"
+            }
+
+            if (gyro == null && gameRot == null) {
+                switchMode(true)
+                activeSensorName = "TOUCHPAD ONLY"
+                modeBadge.text = "• NO MOTION SENSOR FOUND - TOUCHPAD ACTIVE"
             }
         } catch (_: Exception) {}
     }
@@ -868,7 +900,10 @@ class MainActivity : Activity(), SensorEventListener {
     // ==========================================
     // WIRE PROTOCOL (COMPACT TOKENS)
     // ==========================================
-    private fun sendRaw(rawText: String) { ws?.send(rawText) }
+    private fun sendRaw(rawText: String) {
+        totalPacketsSent++
+        ws?.send(rawText)
+    }
 
     // ==========================================
     // NOTHING OS STYLING HELPERS
