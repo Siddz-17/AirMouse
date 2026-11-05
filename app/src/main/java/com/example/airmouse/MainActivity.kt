@@ -34,8 +34,7 @@ class MainActivity : Activity(), SensorEventListener {
         const val APP_VERSION_NAME = "3.0"
 
         const val MODE_AIR = 0
-        const val MODE_SURFACE = 1
-        const val MODE_TOUCHPAD = 2
+        const val MODE_TOUCHPAD = 1
     }
 
     // Motion parameters (Calibrated gentle sensitivity)
@@ -46,18 +45,6 @@ class MainActivity : Activity(), SensorEventListener {
     // Dynamic Auto-Zero Bias Rejection (stops all drift)
     private var biasH = 0f
     private var biasV = 0f
-
-    // Surface Mode Parameters (Dual-Engine: Gyro Swivel/Pitch + Linear Push Impulse)
-    private var surfaceBiasH = 0f
-    private var surfaceBiasV = 0f
-    private var surfaceBiasAx = 0f
-    private var surfaceBiasAy = 0f
-    private var lastSurfaceGyroTs = 0L
-    private var lastSurfaceLinearTs = 0L
-    private val surfaceGyroGain = 1400f
-    private val surfaceAccelGain = 1200f
-    private val surfaceGyroDeadzone = 0.020f // rad/s
-    private val surfaceAccelDeadzone = 0.045f // m/s^2
 
     // Motion State & Smoothing
     private var smoothH = 0f
@@ -96,13 +83,11 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var connectView: LinearLayout
     private lateinit var mainHubView: LinearLayout
     private lateinit var gyroContainer: LinearLayout
-    private lateinit var surfaceContainer: LinearLayout
     private lateinit var touchpadContainer: LinearLayout
     private lateinit var updateBanner: LinearLayout
     private lateinit var updateBannerText: TextView
     private lateinit var updateBannerBtn: TextView
     private lateinit var gyroTabBtn: TextView
-    private lateinit var surfaceTabBtn: TextView
     private lateinit var touchpadTabBtn: TextView
     private lateinit var modeBadge: TextView
     private lateinit var diagnosticHud: TextView
@@ -332,7 +317,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         gyroTabBtn = TextView(this).apply {
             text = "AIR GYRO"
-            textSize = 11f
+            textSize = 12f
             typeface = Typeface.MONOSPACE
             gravity = Gravity.CENTER
             setPadding(0, dp(12), 0, dp(12))
@@ -340,19 +325,9 @@ class MainActivity : Activity(), SensorEventListener {
             setOnClickListener { switchMode(MODE_AIR) }
         }
 
-        surfaceTabBtn = TextView(this).apply {
-            text = "SURFACE"
-            textSize = 11f
-            typeface = Typeface.MONOSPACE
-            gravity = Gravity.CENTER
-            setPadding(0, dp(12), 0, dp(12))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { switchMode(MODE_SURFACE) }
-        }
-
         touchpadTabBtn = TextView(this).apply {
             text = "TOUCHPAD"
-            textSize = 11f
+            textSize = 12f
             typeface = Typeface.MONOSPACE
             gravity = Gravity.CENTER
             setPadding(0, dp(12), 0, dp(12))
@@ -361,7 +336,6 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         modeSwitcher.addView(gyroTabBtn)
-        modeSwitcher.addView(surfaceTabBtn)
         modeSwitcher.addView(touchpadTabBtn)
         mainHubView.addView(modeSwitcher)
 
@@ -388,10 +362,6 @@ class MainActivity : Activity(), SensorEventListener {
 
         gyroContainer = createGyroInterface()
         mainHubView.addView(gyroContainer)
-
-        surfaceContainer = createSurfaceInterface()
-        surfaceContainer.visibility = View.GONE
-        mainHubView.addView(surfaceContainer)
 
         touchpadContainer = createTouchpadInterface()
         touchpadContainer.visibility = View.GONE
@@ -600,92 +570,6 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // NOTHING OS: DESK SURFACE MOUSE UI
-    // ==========================================
-    private fun createSurfaceInterface(): LinearLayout {
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
-        }
-
-        // Top Row: Physical Left & Right Click Pads
-        val topBtnRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(-1, 0, 2.2f).apply { bottomMargin = dp(8) }
-        }
-
-        val leftPad = nothingPad("LEFT CLICK\n( TAP / DRAG )", Color.WHITE, Color.parseColor("#181818"), Color.parseColor("#333333"), dp(22))
-        val rightPad = nothingPad("RIGHT CLICK", Color.WHITE, Color.parseColor("#181818"), Color.parseColor("#333333"), dp(22))
-
-        val dragStart = Runnable {
-            dragging = true
-            haptic(35)
-            sendRaw("d l")
-        }
-        bindTouch(leftPad, {
-            haptic(18)
-            ui.postDelayed(dragStart, 220)
-        }, {
-            ui.removeCallbacks(dragStart)
-            if (dragging) {
-                dragging = false; haptic(16); sendRaw("u l")
-            } else {
-                haptic(22); sendRaw("c l")
-            }
-        })
-
-        bindTouch(rightPad, { haptic(22); sendRaw("c r") }, {})
-
-        topBtnRow.addView(leftPad, LinearLayout.LayoutParams(0, -1, 1.2f).apply { marginEnd = dp(4) })
-        topBtnRow.addView(rightPad, LinearLayout.LayoutParams(0, -1, 1.0f).apply { marginStart = dp(4) })
-        layout.addView(topBtnRow)
-
-        // Middle Row: Scroll Buttons
-        val scrollRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(-1, dp(60)).apply { bottomMargin = dp(8) }
-        }
-        val scrollUp = nothingPad("▲ SCROLL UP", Color.WHITE, Color.parseColor("#121212"), Color.parseColor("#262626"), dp(16))
-        val scrollDown = nothingPad("▼ SCROLL DOWN", Color.WHITE, Color.parseColor("#121212"), Color.parseColor("#262626"), dp(16))
-
-        bindTouch(scrollUp, { haptic(14); sendRaw("s -1.0") }, {})
-        bindTouch(scrollDown, { haptic(14); sendRaw("s 1.0") }, {})
-
-        scrollRow.addView(scrollUp, LinearLayout.LayoutParams(0, -1, 1f).apply { marginEnd = dp(4) })
-        scrollRow.addView(scrollDown, LinearLayout.LayoutParams(0, -1, 1f).apply { marginStart = dp(4) })
-        layout.addView(scrollRow)
-
-        // Bottom Info Card
-        val surfaceInfoCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dp(16), dp(16), dp(16), dp(16))
-            background = nothingCard(Color.parseColor("#0A0A0A"), Color.parseColor("#202020"), dp(18))
-            layoutParams = LinearLayout.LayoutParams(-1, 0, 1.2f)
-        }
-        val title = TextView(this).apply {
-            text = "DESK SURFACE MODE ACTIVE"
-            setTextColor(Color.WHITE)
-            typeface = Typeface.MONOSPACE
-            textSize = 12f
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(4))
-        }
-        val desc = TextView(this).apply {
-            text = "Place phone flat on table or mousepad.\nSlide like a real physical mouse.\n\nLinear Accel + Friction Decaying Engine"
-            setTextColor(Color.parseColor("#737373"))
-            typeface = Typeface.MONOSPACE
-            textSize = 10f
-            gravity = Gravity.CENTER
-        }
-        surfaceInfoCard.addView(title)
-        surfaceInfoCard.addView(desc)
-        layout.addView(surfaceInfoCard)
-
-        return layout
-    }
-
-    // ==========================================
     // MODE SWITCHER LOGIC
     // ==========================================
     private fun switchMode(newMode: Int) {
@@ -694,19 +578,13 @@ class MainActivity : Activity(), SensorEventListener {
         haptic(25)
 
         gyroContainer.visibility = if (currentMode == MODE_AIR) View.VISIBLE else View.GONE
-        surfaceContainer.visibility = if (currentMode == MODE_SURFACE) View.VISIBLE else View.GONE
         touchpadContainer.visibility = if (currentMode == MODE_TOUCHPAD) View.VISIBLE else View.GONE
 
         smoothH = 0f; smoothV = 0f
-        surfaceBiasH = 0f; surfaceBiasV = 0f
-        surfaceBiasAx = 0f; surfaceBiasAy = 0f
-        lastSurfaceGyroTs = 0L
-        lastSurfaceLinearTs = 0L
         lastYaw = Float.NaN; lastPitch = Float.NaN
 
         modeBadge.text = when (currentMode) {
             MODE_AIR -> "• ACTIVE AIR MOUSE (IN THE AIR) | VOL KEYS: CLICK"
-            MODE_SURFACE -> "• DESK SURFACE MOUSE (ON TABLE) | VOL KEYS: CLICK"
             MODE_TOUCHPAD -> "• TOUCHPAD ACTIVE | 2-FINGER SCROLL"
             else -> "• ACTIVE MOUSE"
         }
@@ -719,9 +597,6 @@ class MainActivity : Activity(), SensorEventListener {
 
         gyroTabBtn.background = if (currentMode == MODE_AIR) activeBg else null
         gyroTabBtn.setTextColor(if (currentMode == MODE_AIR) Color.BLACK else inactiveColor)
-
-        surfaceTabBtn.background = if (currentMode == MODE_SURFACE) activeBg else null
-        surfaceTabBtn.setTextColor(if (currentMode == MODE_SURFACE) Color.BLACK else inactiveColor)
 
         touchpadTabBtn.background = if (currentMode == MODE_TOUCHPAD) activeBg else null
         touchpadTabBtn.setTextColor(if (currentMode == MODE_TOUCHPAD) Color.BLACK else inactiveColor)
@@ -901,24 +776,12 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // TRIPLE ENGINE SENSOR PIPELINE: GYRO AIR + DESK SURFACE + ROTATION VECTOR
+    // DUAL ENGINE SENSOR PIPELINE: GYRO AIR + 6-DOF ROTATION VECTOR
     // ==========================================
     override fun onSensorChanged(e: SensorEvent) {
         sensorEventCount++
         if (!connected || currentMode == MODE_TOUCHPAD || gyroPaused) return
 
-        if (currentMode == MODE_SURFACE) {
-            if (e.sensor.type == Sensor.TYPE_GYROSCOPE) {
-                activeSensorName = "SURFACE_GYRO"
-                handleSurfaceGyro(e)
-            } else if (e.sensor.type == Sensor.TYPE_LINEAR_ACCELERATION || e.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-                activeSensorName = "SURFACE_ACCEL"
-                handleSurfaceLinearAccelEvent(e)
-            }
-            return
-        }
-
-        // MODE_AIR
         if (e.sensor.type == Sensor.TYPE_GYROSCOPE) {
             activeSensorName = "GYRO"
             handleGyroscopeEvent(e)
@@ -930,84 +793,6 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
-    private fun handleSurfaceGyro(e: SensorEvent) {
-        val now = e.timestamp
-        if (lastSurfaceGyroTs == 0L) { lastSurfaceGyroTs = now; return }
-        val dt = ((now - lastSurfaceGyroTs) / 1e9f).coerceIn(0.001f, 0.04f)
-        lastSurfaceGyroTs = now
-
-        // Swivel/yaw around Z on table gives Left/Right
-        val rawH = -e.values[2]
-        // Rocking/pitch around X on table gives Up/Down
-        // Pushing forward tilts top down (e.values[0] > 0), so -e.values[0] produces negative dy (UP on Windows)
-        val rawV = -e.values[0]
-
-        // Dynamic auto-zero bias rejection for surface mode
-        if (hypot(rawH, rawV) < 0.035f) {
-            surfaceBiasH = 0.96f * surfaceBiasH + 0.04f * rawH
-            surfaceBiasV = 0.96f * surfaceBiasV + 0.04f * rawV
-        }
-
-        val noBiasH = rawH - surfaceBiasH
-        val noBiasV = rawV - surfaceBiasV
-
-        val inH = if (abs(noBiasH) < surfaceGyroDeadzone) 0f else (noBiasH - sign(noBiasH) * surfaceGyroDeadzone)
-        val inV = if (abs(noBiasV) < surfaceGyroDeadzone) 0f else (noBiasV - sign(noBiasV) * surfaceGyroDeadzone)
-
-        if (abs(inH) > 0f || abs(inV) > 0f) {
-            val mult = surfaceGyroGain * currentSensitivity
-            val dx = (inH * dt * mult).toDouble()
-            val dy = (inV * dt * mult).toDouble()
-            sendSurfaceDelta(dx, dy)
-        }
-    }
-
-    private fun handleSurfaceLinearAccelEvent(e: SensorEvent) {
-        val now = e.timestamp
-        if (lastSurfaceLinearTs == 0L) {
-            lastSurfaceLinearTs = now
-            surfaceBiasAx = e.values[0]
-            surfaceBiasAy = e.values[1]
-            return
-        }
-        val dt = ((now - lastSurfaceLinearTs) / 1e9f).coerceIn(0.001f, 0.04f)
-        lastSurfaceLinearTs = now
-
-        val rawAx = e.values[0]
-        val rawAy = e.values[1]
-
-        // Dynamic auto-zero bias rejection:
-        // When resting flat or steady on table, track table tilt and gravity bias!
-        if (hypot(rawAx - surfaceBiasAx, rawAy - surfaceBiasAy) < 0.07f) {
-            surfaceBiasAx = 0.96f * surfaceBiasAx + 0.04f * rawAx
-            surfaceBiasAy = 0.96f * surfaceBiasAy + 0.04f * rawAy
-        }
-
-        val cleanAx = rawAx - surfaceBiasAx
-        val cleanAy = rawAy - surfaceBiasAy
-
-        val inAx = if (abs(cleanAx) < surfaceAccelDeadzone) 0f else (cleanAx - sign(cleanAx) * surfaceAccelDeadzone)
-        val inAy = if (abs(cleanAy) < surfaceAccelDeadzone) 0f else (cleanAy - sign(cleanAy) * surfaceAccelDeadzone)
-
-        if (abs(inAx) > 0f || abs(inAy) > 0f) {
-            // Linear acceleration impulse:
-            // Pushing forward (+Ay) moves cursor UP (-dy on Windows)
-            // Pushing right (+Ax) moves cursor RIGHT (+dx on Windows)
-            val mult = surfaceAccelGain * currentSensitivity
-            val dx = (inAx * dt * mult).toDouble()
-            val dy = (-inAy * dt * mult).toDouble()
-            sendSurfaceDelta(dx, dy)
-        }
-    }
-
-    private fun sendSurfaceDelta(dx: Double, dy: Double) {
-        if (abs(dx) > 0.005 || abs(dy) > 0.005) {
-            lastSentDx = dx.toFloat()
-            lastSentDy = dy.toFloat()
-            sendRaw("m ${"%.3f".format(Locale.US, dx)} ${"%.3f".format(Locale.US, dy)}")
-        }
-    }
-
     private fun handleGyroscopeEvent(e: SensorEvent) {
         val now = e.timestamp
         if (lastGyroTs == 0L) { lastGyroTs = now; return }
@@ -1015,7 +800,7 @@ class MainActivity : Activity(), SensorEventListener {
         lastGyroTs = now
 
         val rawH = -(e.values[2] + e.values[1])
-        val rawV = e.values[0]
+        val rawV = e.values[0] // Corrected: tilt up = cursor up, tilt down = cursor down
 
         // Dynamic auto-zero bias rejection:
         // Adaptively cancels slow hardware creep when steady
@@ -1085,7 +870,7 @@ class MainActivity : Activity(), SensorEventListener {
         if (abs(dYaw) > 0.0003f || abs(dPitch) > 0.0003f) {
             val mult = gyroPxPerRad * currentSensitivity * 0.85f
             val dx = (-dYaw * mult).toDouble()
-            val dy = (-dPitch * mult).toDouble()
+            val dy = (dPitch * mult).toDouble()
 
             lastSentDx = dx.toFloat()
             lastSentDy = dy.toFloat()
@@ -1115,14 +900,7 @@ class MainActivity : Activity(), SensorEventListener {
                 if (gyro == null) activeSensorName = "FUSION_VEC"
             }
 
-            // 3. Register Linear Acceleration for Desk Surface Mode
-            val linearAccel = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
-                ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-            if (linearAccel != null) {
-                sensorManager.registerListener(this, linearAccel, SensorManager.SENSOR_DELAY_FASTEST)
-            }
-
-            if (gyro == null && gameRot == null && linearAccel == null) {
+            if (gyro == null && gameRot == null) {
                 switchMode(MODE_TOUCHPAD)
                 activeSensorName = "TOUCHPAD ONLY"
                 modeBadge.text = "• NO MOTION SENSOR FOUND - TOUCHPAD ACTIVE"
