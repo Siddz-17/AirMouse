@@ -8,8 +8,8 @@ import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import websockets
 
-CURRENT_VERSION_CODE = 10
-CURRENT_VERSION_NAME = "2.8"
+CURRENT_VERSION_CODE = 11
+CURRENT_VERSION_NAME = "2.9"
 
 # Ensure unbuffered console output
 sys.stdout.reconfigure(line_buffering=True)
@@ -91,8 +91,8 @@ def on_move(dx_str, dy_str):
         user32.mouse_event(MOUSEEVENTF_MOVE, 0, 0, 0, 0)
 
         move_counter += 1
-        if move_counter % 100 == 0:
-            print(f"[Move #{move_counter}] Cursor at ({target_x}, {target_y})", flush=True)
+        if move_counter % 50 == 0:
+            print(f"[Move #{move_counter}] dx:{dx:+.2f} dy:{dy:+.2f} -> Cursor: ({target_x}, {target_y})", flush=True)
 
 def on_scroll(dy_str):
     try:
@@ -206,11 +206,14 @@ async def handler(websocket):
 
     try:
         async for raw in websocket:
-            # Wire tokens: m, s, c, d, u
+            # Wire tokens: m, s, c, d, u, recenter
             if raw.startswith("m "):
                 parts = raw[2:].split()
                 if len(parts) == 2:
                     on_move(parts[0], parts[1])
+            elif raw.startswith("recenter"):
+                user32.SetCursorPos(SCREEN_W // 2, SCREEN_H // 2)
+                print(f"[Recenter] Cursor set to screen center ({SCREEN_W // 2}, {SCREEN_H // 2})", flush=True)
             elif raw.startswith("s "):
                 on_scroll(raw[2:])
             elif raw.startswith("c "):

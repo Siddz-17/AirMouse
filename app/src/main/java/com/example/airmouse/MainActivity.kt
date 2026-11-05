@@ -30,8 +30,8 @@ import kotlin.math.*
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        const val APP_VERSION_CODE = 10
-        const val APP_VERSION_NAME = "2.8"
+        const val APP_VERSION_CODE = 11
+        const val APP_VERSION_NAME = "2.9"
 
         const val MODE_AIR = 0
         const val MODE_SURFACE = 1
@@ -39,17 +39,22 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // Motion parameters (Calibrated gentle sensitivity)
-    private val gyroPxPerRad = 2100f
+    private val gyroPxPerRad = 2300f
     private val gyroScrollPerRad = 50f
-    private val deadzoneThreshold = 0.007f // rad/s (kills MEMS resting noise)
+    private val deadzoneThreshold = 0.012f // rad/s (kills MEMS resting noise)
 
-    // Surface Mode Parameters (Desk sliding physics)
-    private var surfaceVx = 0f
-    private var surfaceVy = 0f
+    // Dynamic Auto-Zero Bias Rejection (stops all drift)
+    private var biasH = 0f
+    private var biasV = 0f
+
+    // Surface Mode Parameters (DC-blocking impulse physics — zero drift)
+    private var surfaceHpX = 0f
+    private var surfaceHpY = 0f
+    private var prevRawAx = 0f
+    private var prevRawAy = 0f
     private var lastLinearTs = 0L
-    private val surfaceAccelGain = 3200f
-    private val surfaceFriction = 0.82f // Decays speed smoothly when stopping
-    private val surfaceDeadzone = 0.12f // m/s^2 (ignores minor desk vibration)
+    private val surfaceImpulseGain = 55f
+    private val surfaceDeadzone = 0.18f // m/s^2
 
     // Motion State & Smoothing
     private var smoothH = 0f
@@ -168,6 +173,19 @@ class MainActivity : Activity(), SensorEventListener {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         topWidget.addView(statusText)
+
+        val centerBtn = TextView(this).apply {
+            text = "( CENTER )"
+            setTextColor(Color.parseColor("#E5E5E5"))
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setPadding(dp(6), dp(4), dp(8), dp(4))
+            setOnClickListener {
+                haptic(30)
+                sendRaw("recenter")
+            }
+        }
+        topWidget.addView(centerBtn)
 
         val closeBtn = TextView(this).apply {
             text = "( DISCONNECT )"
@@ -907,29 +925,33 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun handleSurfaceLinearAccelEvent(e: SensorEvent) {
         val now = e.timestamp
-        if (lastLinearTs == 0L) { lastLinearTs = now; return }
+        if (lastLinearTs == 0L) {
+            lastLinearTs = now
+            prevRawAx = e.values[0]
+            prevRawAy = e.values[1]
+            return
+        }
         val dt = ((now - lastLinearTs) / 1e9f).coerceIn(0.001f, 0.04f)
         lastLinearTs = now
 
-        var rawAx = e.values[0]
-        var rawAy = e.values[1]
+        val rawAx = e.values[0]
+        val rawAy = e.values[1]
 
-        if (abs(rawAx) < surfaceDeadzone) rawAx = 0f
-        if (abs(rawAy) < surfaceDeadzone) rawAy = 0f
+        // DC-blocking high-pass filter: eliminates any gravity tilt bias completely!
+        surfaceHpX = 0.85f * (surfaceHpX + rawAx - prevRawAx)
+        surfaceHpY = 0.85f * (surfaceHpY + rawAy - prevRawAy)
+        prevRawAx = rawAx
+        prevRawAy = rawAy
 
-        // Integrate acceleration into velocity with dynamic friction
-        surfaceVx = (surfaceVx + rawAx * dt * 10f) * surfaceFriction
-        surfaceVy = (surfaceVy + rawAy * dt * 10f) * surfaceFriction
+        val cleanAx = if (abs(surfaceHpX) < surfaceDeadzone) 0f else (surfaceHpX - sign(surfaceHpX) * surfaceDeadzone)
+        val cleanAy = if (abs(surfaceHpY) < surfaceDeadzone) 0f else (surfaceHpY - sign(surfaceHpY) * surfaceDeadzone)
 
-        // Zero Velocity Update (ZUPT): damp velocity immediately when stopping
-        if (rawAx == 0f) surfaceVx *= 0.65f
-        if (rawAy == 0f) surfaceVy *= 0.65f
-
-        val speed = hypot(surfaceVx, surfaceVy)
-        if (speed > 0.001f) {
-            val dx = (surfaceVx * dt * surfaceAccelGain * currentSensitivity).toDouble()
-            // Pushing forward on desk (positive Y) moves cursor UP (-dy on Windows)
-            val dy = (-surfaceVy * dt * surfaceAccelGain * currentSensitivity).toDouble()
+        val mag = hypot(cleanAx, cleanAy)
+        if (mag > 0.02f) {
+            val impulse = min(1.8f, (mag / 0.8f).pow(1.1f))
+            val dx = (cleanAx * dt * surfaceImpulseGain * currentSensitivity * impulse).toDouble()
+            // Forward push on table (positive Ay) moves cursor UP (-dy on Windows)
+            val dy = (-cleanAy * dt * surfaceImpulseGain * currentSensitivity * impulse).toDouble()
 
             lastSentDx = dx.toFloat()
             lastSentDy = dy.toFloat()
@@ -940,8 +962,8 @@ class MainActivity : Activity(), SensorEventListener {
     private fun handleSurfaceYawAssist(e: SensorEvent) {
         // When swiveling/pivoting phone on desk, add smooth horizontal delta
         val yawOmega = -e.values[2]
-        if (abs(yawOmega) > 0.06f) {
-            val dx = (yawOmega * 0.005f * 1200f * currentSensitivity).toDouble()
+        if (abs(yawOmega) > 0.08f) {
+            val dx = (yawOmega * 0.005f * 1000f * currentSensitivity).toDouble()
             sendRaw("m ${"%.3f".format(Locale.US, dx)} 0.000")
         }
     }
@@ -952,22 +974,26 @@ class MainActivity : Activity(), SensorEventListener {
         val dt = ((now - lastGyroTs) / 1e9f).coerceIn(0.001f, 0.04f)
         lastGyroTs = now
 
-        // Direct, robust 3D rotation projection:
-        // Turning left/right (yaw) causes rotation around Z (wrist/pointing) and Y (panning).
-        // Summing them gives instant responsive horizontal tracking at any hand inclination.
         val rawH = -(e.values[2] + e.values[1])
-
-        // Tilting UP (top goes towards user) produces negative values[0];
-        // Windows cursor UP is negative dy.
         val rawV = -e.values[0]
 
-        // Deadzone: remove resting physiological hand tremor
-        val magH = abs(rawH)
-        val magV = abs(rawV)
-        val inH = if (magH < deadzoneThreshold) 0f else (rawH - sign(rawH) * deadzoneThreshold)
-        val inV = if (magV < deadzoneThreshold) 0f else (rawV - sign(rawV) * deadzoneThreshold)
+        // Dynamic auto-zero bias rejection:
+        // Adaptively cancels slow hardware creep when steady
+        if (hypot(rawH, rawV) < 0.025f) {
+            biasH = 0.96f * biasH + 0.04f * rawH
+            biasV = 0.96f * biasV + 0.04f * rawV
+        }
 
-        // Low-latency exponential smoothing filter (alpha = 0.65 -> <8ms response)
+        val noBiasH = rawH - biasH
+        val noBiasV = rawV - biasV
+
+        // Deadzone: remove resting physiological hand tremor
+        val magH = abs(noBiasH)
+        val magV = abs(noBiasV)
+        val inH = if (magH < deadzoneThreshold) 0f else (noBiasH - sign(noBiasH) * deadzoneThreshold)
+        val inV = if (magV < deadzoneThreshold) 0f else (noBiasV - sign(noBiasV) * deadzoneThreshold)
+
+        // Low-latency exponential smoothing filter
         val speed = hypot(inH, inV)
         val alpha = (0.50f + 0.35f * min(1.0f, speed / 0.5f)).coerceIn(0.40f, 0.85f)
         smoothH += alpha * (inH - smoothH)
