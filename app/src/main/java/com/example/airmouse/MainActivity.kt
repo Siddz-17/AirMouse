@@ -695,7 +695,7 @@ class MainActivity : Activity(), SensorEventListener {
         touchpadContainer.visibility = if (currentMode == MODE_TOUCHPAD) View.VISIBLE else View.GONE
 
         smoothH = 0f; smoothV = 0f
-        surfaceVx = 0f; surfaceVy = 0f
+        surfaceHpX = 0f; surfaceHpY = 0f
         lastYaw = Float.NaN; lastPitch = Float.NaN
 
         modeBadge.text = when (currentMode) {
