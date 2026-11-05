@@ -2,10 +2,9 @@ import asyncio
 import json
 import ctypes
 import sys
-import os
 import websockets
 
-# Ensure immediate unbuffered output
+# Ensure unbuffered console output
 sys.stdout.reconfigure(line_buffering=True)
 
 # Windows mouse_event constants
@@ -15,19 +14,39 @@ MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_WHEEL = 0x0800
+DESKTOP_ALL = 0x01FF
 
 user32 = ctypes.windll.user32
 
-# Sub-pixel accumulator to prevent dropping fractional movements
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+def get_cursor_pos():
+    pt = POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+def attach_to_default_desktop():
+    try:
+        hdesk = user32.OpenDesktopW("Default", 0, False, DESKTOP_ALL)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+            return True
+    except Exception as e:
+        print(f"[!] Desktop attach error: {e}", flush=True)
+    return False
+
+# Sensitivity tuning (1.0 = standard, 1.5 = faster)
+SENSITIVITY = 1.5
+
 accum_x = 0.0
 accum_y = 0.0
 move_counter = 0
 
 def on_move(dx, dy):
     global accum_x, accum_y, move_counter
-    # Sensitivity multiplier can be adjusted if needed
-    accum_x += float(dx)
-    accum_y += float(dy)
+    accum_x += float(dx) * SENSITIVITY
+    accum_y += float(dy) * SENSITIVITY
     step_x = int(accum_x)
     step_y = int(accum_y)
     if step_x != 0 or step_y != 0:
@@ -35,8 +54,9 @@ def on_move(dx, dy):
         accum_y -= step_y
         user32.mouse_event(MOUSEEVENTF_MOVE, step_x, step_y, 0, 0)
         move_counter += 1
-        if move_counter % 20 == 0:
-            print(f"[Move] dx={step_x}, dy={step_y} (sent {move_counter} moves)", flush=True)
+        if move_counter % 25 == 0:
+            cx, cy = get_cursor_pos()
+            print(f"[Move #{move_counter}] step=({step_x}, {step_y}) -> Cursor at ({cx}, {cy})", flush=True)
 
 def on_scroll(dy):
     delta = int(round(float(dy) * 120))
@@ -64,8 +84,11 @@ def on_up(button):
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
 async def handler(websocket):
+    # Ensure current thread is attached to user's interactive desktop
+    attach_to_default_desktop()
     client_ip = websocket.remote_address[0]
-    print(f"\n[+] Phone connected from: {client_ip}", flush=True)
+    cx, cy = get_cursor_pos()
+    print(f"\n[+] Phone connected from: {client_ip} | Starting cursor pos: ({cx}, {cy})", flush=True)
     try:
         async for raw in websocket:
             try:
@@ -81,20 +104,21 @@ async def handler(websocket):
                     on_down(msg.get("b", "left"))
                 elif action == "up":
                     on_up(msg.get("b", "left"))
-                else:
-                    print(f"[?] Unknown action: {msg}", flush=True)
             except Exception as e:
-                print(f"[!] Error handling message: {e}", flush=True)
+                print(f"[!] Parse error: {e}", flush=True)
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
         print(f"[-] Phone disconnected: {client_ip}\n", flush=True)
 
 async def main():
+    attach_to_default_desktop()
     port = 8080
     host = "0.0.0.0"
+    cx, cy = get_cursor_pos()
     print("=" * 60, flush=True)
     print(f"AirMouse Server running on ws://0.0.0.0:{port}", flush=True)
+    print(f"Attached to interactive desktop. Cursor at: ({cx}, {cy})", flush=True)
     print("Waiting for phone to connect...", flush=True)
     print("=" * 60, flush=True)
     async with websockets.serve(handler, host, port):
