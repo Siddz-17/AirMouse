@@ -1,6 +1,7 @@
 import asyncio
 import json
 import ctypes
+import ctypes.wintypes
 import sys
 import os
 import socket
@@ -8,8 +9,8 @@ import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import websockets
 
-CURRENT_VERSION_CODE = 5
-CURRENT_VERSION_NAME = "2.3"
+CURRENT_VERSION_CODE = 6
+CURRENT_VERSION_NAME = "2.4"
 
 # Ensure unbuffered console output
 sys.stdout.reconfigure(line_buffering=True)
@@ -20,77 +21,149 @@ try:
 except Exception:
     pass
 
-# Windows mouse_event constants
-MOUSEEVENTF_MOVE = 0x0001
-MOUSEEVENTF_LEFTDOWN = 0x0002
-MOUSEEVENTF_LEFTUP = 0x0004
-MOUSEEVENTF_RIGHTDOWN = 0x0008
-MOUSEEVENTF_RIGHTUP = 0x0010
-MOUSEEVENTF_WHEEL = 0x0800
-DESKTOP_ALL = 0x01FF
+# ==========================================
+# SendInput Structures (absolute mouse input)
+# ==========================================
+PUL = ctypes.POINTER(ctypes.c_ulong)
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx",          ctypes.c_long),
+        ("dy",          ctypes.c_long),
+        ("mouseData",   ctypes.c_ulong),
+        ("dwFlags",     ctypes.c_ulong),
+        ("time",        ctypes.c_ulong),
+        ("dwExtraInfo", PUL),
+    ]
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT)]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_ulong),
+        ("_u",   _INPUT_UNION),
+    ]
+
+INPUT_MOUSE               = 0
+MOUSEEVENTF_MOVE          = 0x0001
+MOUSEEVENTF_LEFTDOWN      = 0x0002
+MOUSEEVENTF_LEFTUP        = 0x0004
+MOUSEEVENTF_RIGHTDOWN     = 0x0008
+MOUSEEVENTF_RIGHTUP       = 0x0010
+MOUSEEVENTF_WHEEL         = 0x0800
+MOUSEEVENTF_ABSOLUTE      = 0x8000
+MOUSEEVENTF_VIRTUALDESK   = 0x4000   # needed for multi-monitor absolute
 
 user32 = ctypes.windll.user32
 
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+# Screen dimensions (read once at startup)
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+SM_XVIRTUALSCREEN  = 76
+SM_YVIRTUALSCREEN  = 77
 
-def get_cursor_pos():
-    pt = POINT()
-    user32.GetCursorPos(ctypes.byref(pt))
-    return pt.x, pt.y
+SCREEN_W = user32.GetSystemMetrics(0)   # primary width
+SCREEN_H = user32.GetSystemMetrics(1)   # primary height
 
-def attach_to_default_desktop():
-    try:
-        hdesk = user32.OpenDesktopW("Default", 0, False, DESKTOP_ALL)
-        if hdesk:
-            user32.SetThreadDesktop(hdesk)
-            return True
-    except Exception as e:
-        print(f"[!] Desktop attach error: {e}", flush=True)
-    return False
+# Cursor tracking in pixel space
+cur_x = float(SCREEN_W) / 2.0
+cur_y = float(SCREEN_H) / 2.0
 
+# Sub-pixel accumulators
 accum_x = 0.0
 accum_y = 0.0
+
 move_counter = 0
 
-def on_move(dx, dy):
-    global accum_x, accum_y, move_counter
-    accum_x += float(dx)
-    accum_y += float(dy)
+def _send_input_move_absolute(px: int, py: int):
+    """Send an absolute mouse move via SendInput — works from ANY Windows session."""
+    # Normalize to 0-65535 range (SendInput absolute coordinates)
+    norm_x = int(px * 65535 / max(1, SCREEN_W - 1))
+    norm_y = int(py * 65535 / max(1, SCREEN_H - 1))
+    norm_x = max(0, min(65535, norm_x))
+    norm_y = max(0, min(65535, norm_y))
+
+    mi = MOUSEINPUT(
+        dx=norm_x,
+        dy=norm_y,
+        mouseData=0,
+        dwFlags=MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+        time=0,
+        dwExtraInfo=PUL(ctypes.c_ulong(0))
+    )
+    inp = INPUT(type=INPUT_MOUSE, _u=_INPUT_UNION(mi=mi))
+    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+
+def _send_input_button(flags: int, wheel_delta: int = 0):
+    mi = MOUSEINPUT(
+        dx=0, dy=0,
+        mouseData=ctypes.c_ulong(wheel_delta & 0xFFFFFFFF),
+        dwFlags=flags,
+        time=0,
+        dwExtraInfo=PUL(ctypes.c_ulong(0))
+    )
+    inp = INPUT(type=INPUT_MOUSE, _u=_INPUT_UNION(mi=mi))
+    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+
+def on_move(dx_str, dy_str):
+    global cur_x, cur_y, accum_x, accum_y, move_counter
+    try:
+        dx = float(dx_str)
+        dy = float(dy_str)
+    except ValueError:
+        return
+
+    accum_x += dx
+    accum_y += dy
+
     step_x = int(accum_x)
     step_y = int(accum_y)
+
     if step_x != 0 or step_y != 0:
         accum_x -= step_x
         accum_y -= step_y
-        user32.mouse_event(MOUSEEVENTF_MOVE, step_x, step_y, 0, 0)
+        cur_x = max(0.0, min(float(SCREEN_W - 1), cur_x + step_x))
+        cur_y = max(0.0, min(float(SCREEN_H - 1), cur_y + step_y))
+        _send_input_move_absolute(int(cur_x), int(cur_y))
+
         move_counter += 1
-        if move_counter % 80 == 0:
-            cx, cy = get_cursor_pos()
-            print(f"[Move #{move_counter}] Cursor at ({cx}, {cy})", flush=True)
+        if move_counter % 100 == 0:
+            print(f"[Move #{move_counter}] Cursor at ({int(cur_x)}, {int(cur_y)})", flush=True)
 
-def on_scroll(dy):
-    delta = int(round(float(dy) * 120))
+
+def on_scroll(dy_str):
+    try:
+        delta = int(round(float(dy_str) * 120))
+    except ValueError:
+        return
     if delta != 0:
-        user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+        _send_input_button(MOUSEEVENTF_WHEEL, delta)
 
-def on_click(button):
+
+def on_click(button: str):
     print(f"[Click] {button}", flush=True)
     if button == "left":
-        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        _send_input_button(MOUSEEVENTF_LEFTDOWN)
+        _send_input_button(MOUSEEVENTF_LEFTUP)
     elif button == "right":
-        user32.mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-        user32.mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+        _send_input_button(MOUSEEVENTF_RIGHTDOWN)
+        _send_input_button(MOUSEEVENTF_RIGHTUP)
 
-def on_down(button):
+
+def on_down(button: str):
     print(f"[Down] {button}", flush=True)
     if button == "left":
-        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        _send_input_button(MOUSEEVENTF_LEFTDOWN)
 
-def on_up(button):
+
+def on_up(button: str):
     print(f"[Up] {button}", flush=True)
     if button == "left":
-        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        _send_input_button(MOUSEEVENTF_LEFTUP)
+
 
 # ==========================================
 # OTA HTTP UPDATE SERVER (PORT 8081)
@@ -133,16 +206,16 @@ class OTAHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
 def run_http_ota(port=8081):
     server = ThreadingHTTPServer(("0.0.0.0", port), OTAHandler)
     server.serve_forever()
+
 
 # ==========================================
 # ULTRA-LOW LATENCY WEBSOCKET (PORT 8080)
 # ==========================================
 async def handler(websocket):
-    attach_to_default_desktop()
-
     try:
         sock = websocket.transport.get_extra_info("socket")
         if sock:
@@ -151,10 +224,10 @@ async def handler(websocket):
         pass
 
     client_ip = websocket.remote_address[0]
-    cx, cy = get_cursor_pos()
-    print(f"\n[+] Phone connected from: {client_ip} | Starting cursor: ({cx}, {cy})", flush=True)
+    print(f"\n[+] Phone connected from: {client_ip}", flush=True)
 
-    server_ip = "192.168.0.107"
+    # Detect our own outbound IP towards the phone
+    server_ip = "127.0.0.1"
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect((client_ip, 80))
@@ -177,7 +250,6 @@ async def handler(websocket):
 
     try:
         async for raw in websocket:
-            # Fast-path: Raw Compact Wire Protocol tokens (m, s, c, d, u)
             if raw.startswith("m "):
                 parts = raw[2:].split()
                 if len(parts) == 2:
@@ -192,7 +264,6 @@ async def handler(websocket):
             elif raw.startswith("u "):
                 on_up("left")
             elif raw.startswith("{"):
-                # JSON fallback
                 try:
                     msg = json.loads(raw)
                     action = msg.get("t")
@@ -213,25 +284,26 @@ async def handler(websocket):
     finally:
         print(f"[-] Phone disconnected: {client_ip}\n", flush=True)
 
+
 async def main():
-    attach_to_default_desktop()
     ws_port = 8080
     ota_port = 8081
 
     ota_thread = threading.Thread(target=run_http_ota, args=(ota_port,), daemon=True)
     ota_thread.start()
 
-    cx, cy = get_cursor_pos()
     print("=" * 65, flush=True)
-    print(f"AirMouse Nothing Engine v{CURRENT_VERSION_NAME} (1ms Kernel Timer)")
-    print(f"  ● Input WebSocket   : ws://0.0.0.0:{ws_port}")
-    print(f"  ● In-App OTA Flash  : http://0.0.0.0:{ota_port}/AirMouse.apk")
-    print(f"  ● Interactive Screen: Attached (Cursor: {cx}, {cy})")
+    print(f"AirMouse Nothing Engine v{CURRENT_VERSION_NAME} (SendInput Absolute)")
+    print(f"  Screen       : {SCREEN_W}x{SCREEN_H}")
+    print(f"  WebSocket    : ws://0.0.0.0:{ws_port}")
+    print(f"  OTA Flash    : http://0.0.0.0:{ota_port}/AirMouse.apk")
+    print(f"  Input method : SendInput ABSOLUTE (session-independent)")
     print("Waiting for phone connection...", flush=True)
     print("=" * 65, flush=True)
 
     async with websockets.serve(handler, "0.0.0.0", ws_port, ping_interval=None, ping_timeout=None):
         await asyncio.Future()
+
 
 if __name__ == "__main__":
     try:
