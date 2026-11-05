@@ -30,14 +30,14 @@ import kotlin.math.*
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        const val APP_VERSION_CODE = 8
-        const val APP_VERSION_NAME = "2.6"
+        const val APP_VERSION_CODE = 9
+        const val APP_VERSION_NAME = "2.7"
     }
 
-    // Motion parameters
-    private val gyroPxPerRad = 3600f
-    private val gyroScrollPerRad = 60f
-    private val deadzoneThreshold = 0.006f // rad/s (kills MEMS resting noise)
+    // Motion parameters (Calibrated gentle sensitivity)
+    private val gyroPxPerRad = 2100f
+    private val gyroScrollPerRad = 50f
+    private val deadzoneThreshold = 0.007f // rad/s (kills MEMS resting noise)
 
     // Motion State & Smoothing
     private var smoothH = 0f
@@ -119,7 +119,7 @@ class MainActivity : Activity(), SensorEventListener {
         } catch (_: Exception) {}
 
         val prefs = getSharedPreferences("air_nothing", MODE_PRIVATE)
-        currentSensitivity = prefs.getFloat("sensitivity", 1.0f)
+        currentSensitivity = prefs.getFloat("sensitivity", 0.8f)
         serverIp = prefs.getString("ip", "192.168.0.107") ?: "192.168.0.107"
 
         // Root — pure pitch black Nothing OS background
@@ -364,11 +364,11 @@ class MainActivity : Activity(), SensorEventListener {
             gravity = Gravity.CENTER
         }
         val sensBar = SeekBar(this).apply {
-            max = 250
-            progress = ((currentSensitivity - 0.5f) / 2.5f * 250).toInt().coerceIn(0, 250)
+            max = 180
+            progress = ((currentSensitivity - 0.2f) / 1.8f * 180).toInt().coerceIn(0, 180)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    currentSensitivity = 0.5f + (p / 250f) * 2.5f
+                    currentSensitivity = 0.2f + (p / 180f) * 1.8f
                     sensTitle.text = "SENSITIVITY // ${"%.1f".format(currentSensitivity)}X"
                     prefs.edit().putFloat("sensitivity", currentSensitivity).apply()
                 }
@@ -811,8 +811,8 @@ class MainActivity : Activity(), SensorEventListener {
         } else {
             val smoothSpeed = hypot(smoothH, smoothV)
             if (smoothSpeed > 0.002f) {
-                // Natural mouse ballistics curve
-                val accel = (0.90f + 1.6f * min(1.0f, (smoothSpeed / 1.2f).pow(1.2f))).coerceIn(0.90f, 2.8f)
+                // Gentle, controlled mouse ballistics curve
+                val accel = (0.75f + 0.70f * min(1.0f, (smoothSpeed / 1.5f).pow(1.1f))).coerceIn(0.70f, 1.7f)
                 val mult = gyroPxPerRad * currentSensitivity * accel
 
                 val dx = (smoothH * dt * mult).toDouble()
@@ -847,7 +847,7 @@ class MainActivity : Activity(), SensorEventListener {
         lastPitch = pitch
 
         if (abs(dYaw) > 0.0003f || abs(dPitch) > 0.0003f) {
-            val mult = gyroPxPerRad * currentSensitivity * 1.2f
+            val mult = gyroPxPerRad * currentSensitivity * 0.85f
             val dx = (-dYaw * mult).toDouble()
             val dy = (-dPitch * mult).toDouble()
 
