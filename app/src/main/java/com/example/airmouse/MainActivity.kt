@@ -30,22 +30,21 @@ import kotlin.math.*
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        const val APP_VERSION_CODE = 6
-        const val APP_VERSION_NAME = "2.4"
+        const val APP_VERSION_CODE = 7
+        const val APP_VERSION_NAME = "2.5"
     }
 
-    // ==========================================
-    // ONE-EURO FILTER — eliminates jitter while keeping high-speed response
-    // Based on: Casiez et al. 2012 "1€ Filter"
-    // ==========================================
+    // =========================================================================
+    // 1€ FILTER (Casiez et al.) — Rock-solid stability when still, zero lag on flicks
+    // =========================================================================
     private inner class OneEuroFilter(
-        private val minCutoff: Float = 1.5f,   // Hz — lower = smoother at slow speed
-        private val beta: Float = 8.0f,         // larger = less lag at fast speed
-        private val dCutoff: Float = 1.0f       // derivative cutoff Hz
+        private val minCutoff: Float = 0.85f, // Hz: Heavy damping below 0.85 Hz removes hand tremor
+        private val beta: Float = 0.02f,       // Low beta ensures jitter does not leak into motion
+        private val dCutoff: Float = 1.0f      // Derivative filter cutoff Hz
     ) {
         private var xPrev: Float? = null
         private var dxPrev = 0f
-        private var tPrev = 0L  // nanoseconds
+        private var tPrev = 0L
 
         private fun alpha(cutoff: Float, dt: Float): Float {
             val tau = 1f / (2f * PI.toFloat() * cutoff)
@@ -59,13 +58,13 @@ class MainActivity : Activity(), SensorEventListener {
             val dt = ((timestamp - tPrev) / 1e9f).coerceIn(0.001f, 0.05f)
             tPrev = timestamp
 
-            // Derivative (speed estimate)
+            // Filter the derivative (speed of motion)
             val dx = (x - xPrev!!) / dt
             val aD = alpha(dCutoff, dt)
             val dxHat = aD * dx + (1f - aD) * dxPrev
             dxPrev = dxHat
 
-            // Adaptive cutoff: higher speed → higher cutoff → less smoothing → less lag
+            // Dynamically adjust cutoff: Still = minCutoff (smooth), Fast = higher (responsive)
             val cutoff = minCutoff + beta * abs(dxHat)
             val a = alpha(cutoff, dt)
             val xHat = a * x + (1f - a) * xPrev!!
@@ -73,19 +72,23 @@ class MainActivity : Activity(), SensorEventListener {
             return xHat
         }
 
-        fun reset() { xPrev = null; dxPrev = 0f }
+        fun reset() {
+            xPrev = null
+            dxPrev = 0f
+            tPrev = 0L
+        }
     }
 
-    // One-euro filters for gyro axes
-    private val filterH = OneEuroFilter(minCutoff = 1.2f, beta = 7.0f)
-    private val filterV = OneEuroFilter(minCutoff = 1.2f, beta = 7.0f)
+    private val filterH = OneEuroFilter(minCutoff = 0.85f, beta = 0.020f)
+    private val filterV = OneEuroFilter(minCutoff = 0.85f, beta = 0.020f)
 
-    // Tuning
-    private val gyroPxPerRad = 2000f
-    private val gyroScrollPerRad = 45f
-    private val deadzone = 0.012f           // rad/s — ignore micro-tremor
+    // Motion parameters
+    private val gyroPxPerRad = 2200f
+    private val gyroScrollPerRad = 50f
+    private val deadzoneThreshold = 0.010f // rad/s
 
     // Gravity vector for 3D tilt compensation
+    private var gravX = 0.0f
     private var gravY = 7.0f
     private var gravZ = 7.0f
 
@@ -101,7 +104,7 @@ class MainActivity : Activity(), SensorEventListener {
     private var sm: SensorManager? = null
     private var vibrator: Vibrator? = null
 
-    // UI Elements
+    // UI Elements (Nothing Phone Aesthetic)
     private lateinit var statusText: TextView
     private lateinit var statusDot: TextView
     private lateinit var connectView: LinearLayout
@@ -152,7 +155,7 @@ class MainActivity : Activity(), SensorEventListener {
         currentSensitivity = prefs.getFloat("sensitivity", 1.0f)
         serverIp = prefs.getString("ip", "192.168.0.107") ?: "192.168.0.107"
 
-        // Root — pure pitch black
+        // Root — pure pitch black Nothing OS background
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
@@ -160,7 +163,7 @@ class MainActivity : Activity(), SensorEventListener {
         }
 
         // ==========================================
-        // TOP HUD WIDGET
+        // NOTHING OS: TOP HUD WIDGET
         // ==========================================
         val topWidget = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -171,7 +174,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         statusDot = TextView(this).apply {
             text = "● "
-            setTextColor(Color.parseColor("#D71921"))
+            setTextColor(Color.parseColor("#D71921")) // Nothing Iconic Red
             textSize = 12f
         }
         topWidget.addView(statusDot)
@@ -201,7 +204,7 @@ class MainActivity : Activity(), SensorEventListener {
         root.addView(topWidget)
 
         // ==========================================
-        // FIRMWARE UPDATE PILL
+        // NOTHING OS: FIRMWARE UPDATE PILL
         // ==========================================
         updateBanner = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -252,7 +255,7 @@ class MainActivity : Activity(), SensorEventListener {
             setPadding(0, 0, 0, dp(6))
         }
         val dotMatrixSubtitle = TextView(this).apply {
-            text = "1€ FILTER ENGINE V$APP_VERSION_NAME • 200HZ"
+            text = "OPTICAL 1€ ENGINE V$APP_VERSION_NAME • 200HZ"
             setTextColor(Color.parseColor("#666666"))
             typeface = Typeface.MONOSPACE
             textSize = 11f
@@ -350,7 +353,7 @@ class MainActivity : Activity(), SensorEventListener {
         mainHubView.addView(modeSwitcher)
 
         modeBadge = TextView(this).apply {
-            text = "• 1€ FILTER ENGINE ACTIVE  |  VOL KEYS: CLICK"
+            text = "• 3D ORIENTATION + 1€ FILTER ACTIVE  |  VOL KEYS: CLICK"
             setTextColor(Color.parseColor("#888888"))
             typeface = Typeface.MONOSPACE
             textSize = 10f
@@ -405,7 +408,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // GYRO AIR REMOTE UI
+    // NOTHING OS: GYRO AIR REMOTE UI
     // ==========================================
     private fun createGyroInterface(): LinearLayout {
         val layout = LinearLayout(this).apply {
@@ -444,16 +447,14 @@ class MainActivity : Activity(), SensorEventListener {
         })
 
         bindTouch(rightPad, { haptic(22); sendRaw("c r") }, {})
-
         bindTouch(scrollPad, { haptic(16); gyroScrolling = true }, { gyroScrolling = false })
-
         bindTouch(freezePad, { haptic(16); gyroPaused = true }, { gyroPaused = false })
 
         return layout
     }
 
     // ==========================================
-    // PRECISION TOUCHPAD UI
+    // NOTHING OS: PRECISION TOUCHPAD UI
     // ==========================================
     @SuppressLint("ClickableViewAccessibility")
     private fun createTouchpadInterface(): LinearLayout {
@@ -554,7 +555,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // MODE SWITCHER
+    // MODE SWITCHER LOGIC
     // ==========================================
     private fun switchMode(touchpad: Boolean) {
         if (isTouchpadMode == touchpad) return
@@ -567,7 +568,7 @@ class MainActivity : Activity(), SensorEventListener {
         } else {
             touchpadContainer.visibility = View.GONE
             gyroContainer.visibility = View.VISIBLE
-            modeBadge.text = "• 1€ FILTER ENGINE ACTIVE  |  VOL KEYS: CLICK"
+            modeBadge.text = "• 3D ORIENTATION + 1€ FILTER ACTIVE  |  VOL KEYS: CLICK"
             filterH.reset(); filterV.reset()
         }
         updateTabStyles()
@@ -588,7 +589,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // WI-FI LOW LATENCY LOCK
+    // ULTRA-LOW LATENCY NETWORK & WI-FI LOCK
     // ==========================================
     private fun acquireWifiLock() {
         try {
@@ -732,7 +733,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // VOLUME BUTTON CLICKS
+    // HARDWARE VOLUME BUTTON CLICKS
     // ==========================================
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (connected && mainHubView.visibility == View.VISIBLE) {
@@ -760,11 +761,21 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // ONE-EURO FILTERED GYRO ENGINE
+    // OPTICAL MOTION ENGINE: 3D ORIENTATION + 1€ FILTER
     // ==========================================
+    private fun softDeadzone(v: Float, threshold: Float): Float {
+        val a = abs(v)
+        if (a <= threshold) return 0f
+        // Smoothstep ramp from threshold to 2.5 * threshold
+        val t = ((a - threshold) / (1.5f * threshold)).coerceIn(0f, 1f)
+        val smooth = t * t * (3f - 2f * t)
+        return (v / a) * (a - threshold) * smooth
+    }
+
     override fun onSensorChanged(e: SensorEvent) {
-        // Gravity / accelerometer — update tilt vector for 3D compensation
+        // Track gravity vector to project hand motion onto true world horizontal/vertical
         if (e.sensor.type == Sensor.TYPE_GRAVITY || e.sensor.type == Sensor.TYPE_ACCELEROMETER) {
+            gravX = 0.90f * gravX + 0.10f * e.values[0]
             gravY = 0.90f * gravY + 0.10f * e.values[1]
             gravZ = 0.90f * gravZ + 0.10f * e.values[2]
             return
@@ -779,23 +790,29 @@ class MainActivity : Activity(), SensorEventListener {
         lastGyroTs = now
         if (gyroPaused) return
 
-        // 3D tilt compensation — project gyro axes onto screen plane regardless of phone angle
+        // 3D Tilt Compensation:
+        // When holding the phone flat, horizontal rotation comes from Z.
+        // When holding the phone upright, horizontal rotation comes from Y.
+        // Both Y and Z contribute constructively!
         val denom = max(0.1f, hypot(gravY, gravZ))
         val cosTilt = (gravZ / denom).coerceIn(-1f, 1f)
         val sinTilt = (gravY / denom).coerceIn(-1f, 1f)
 
-        val rawH = -(e.values[2] * cosTilt - e.values[1] * sinTilt)
-        val rawV = -e.values[0]
+        // Raw Horizontal Angular Velocity (constructive yaw)
+        // Turning left produces positive gyro readings; we want negative dx (cursor moves left).
+        val rawH = -(e.values[1] * sinTilt + e.values[2] * cosTilt)
 
-        // Hard deadzone to kill sensor noise when phone is still
-        val absH = abs(rawH)
-        val absV = abs(rawV)
-        val inH = if (absH < deadzone) 0f else rawH
-        val inV = if (absV < deadzone) 0f else rawV
+        // Raw Vertical Angular Velocity (pitch)
+        // Tilting UP (top rotates back/up) produces negative values[0]; we want negative dy (cursor moves up).
+        val rawV = e.values[0]
 
-        // One-euro filter — the gold standard for pointer smoothing
-        val filtH = filterH.filter(inH, now)
-        val filtV = filterV.filter(inV, now)
+        // Smooth continuous deadzone removes MEMS sensor noise and resting hand tremor
+        val cleanH = softDeadzone(rawH, deadzoneThreshold)
+        val cleanV = softDeadzone(rawV, deadzoneThreshold)
+
+        // One-Euro adaptive filter: Rock steady when still, zero lag on flicks
+        val filtH = filterH.filter(cleanH, now)
+        val filtV = filterV.filter(cleanV, now)
 
         if (gyroScrolling) {
             if (abs(filtV) > 0.005f) {
@@ -804,12 +821,14 @@ class MainActivity : Activity(), SensorEventListener {
             }
         } else {
             val speed = hypot(filtH, filtV)
-            if (speed > 0.004f) {
-                // Pointer acceleration — mimics OS mouse ballistics
-                val accel = (0.80f + 1.5f * min(1.0f, (speed / 1.2f).pow(1.1f))).coerceIn(0.75f, 2.5f)
+            if (speed > 0.003f) {
+                // Optical Mouse Ballistics (True mouse acceleration curve)
+                val accel = (0.90f + 1.8f * min(1.0f, (speed / 1.5f).pow(1.3f))).coerceIn(0.85f, 3.0f)
                 val mult = gyroPxPerRad * currentSensitivity * accel
+
                 val dx = (filtH * dt * mult).toDouble()
                 val dy = (filtV * dt * mult).toDouble()
+
                 sendRaw("m ${"%.3f".format(Locale.US, dx)} ${"%.3f".format(Locale.US, dy)}")
             }
         }
@@ -847,16 +866,16 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // WIRE PROTOCOL
+    // WIRE PROTOCOL (COMPACT TOKENS)
     // ==========================================
     private fun sendRaw(rawText: String) { ws?.send(rawText) }
 
     // ==========================================
-    // NOTHING OS STYLING
+    // NOTHING OS STYLING HELPERS
     // ==========================================
     private fun nothingCard(bgColor: Int, strokeColor: Int, radiusDp: Int) = GradientDrawable().apply {
         setColor(bgColor)
-        cornerRadius = radiusDp.toFloat()
+        cornerRadius = dp(radiusDp).toFloat()
         setStroke(dp(1), strokeColor)
     }
 
