@@ -2,6 +2,7 @@ import asyncio
 import json
 import ctypes
 import sys
+import socket
 import websockets
 
 # Ensure unbuffered console output
@@ -36,17 +37,14 @@ def attach_to_default_desktop():
         print(f"[!] Desktop attach error: {e}", flush=True)
     return False
 
-# Sensitivity tuning (1.0 = standard, 1.5 = faster)
-SENSITIVITY = 1.5
-
 accum_x = 0.0
 accum_y = 0.0
 move_counter = 0
 
 def on_move(dx, dy):
     global accum_x, accum_y, move_counter
-    accum_x += float(dx) * SENSITIVITY
-    accum_y += float(dy) * SENSITIVITY
+    accum_x += float(dx)
+    accum_y += float(dy)
     step_x = int(accum_x)
     step_y = int(accum_y)
     if step_x != 0 or step_y != 0:
@@ -54,15 +52,14 @@ def on_move(dx, dy):
         accum_y -= step_y
         user32.mouse_event(MOUSEEVENTF_MOVE, step_x, step_y, 0, 0)
         move_counter += 1
-        if move_counter % 25 == 0:
+        if move_counter % 50 == 0:
             cx, cy = get_cursor_pos()
-            print(f"[Move #{move_counter}] step=({step_x}, {step_y}) -> Cursor at ({cx}, {cy})", flush=True)
+            print(f"[Move #{move_counter}] Cursor at ({cx}, {cy})", flush=True)
 
 def on_scroll(dy):
     delta = int(round(float(dy) * 120))
     if delta != 0:
         user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
-        print(f"[Scroll] delta={delta}", flush=True)
 
 def on_click(button):
     print(f"[Click] {button}", flush=True)
@@ -84,11 +81,18 @@ def on_up(button):
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
 async def handler(websocket):
-    # Ensure current thread is attached to user's interactive desktop
     attach_to_default_desktop()
+    # Enable TCP_NODELAY for lowest possible ping over Wi-Fi
+    try:
+        sock = websocket.transport.get_extra_info("socket")
+        if sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+
     client_ip = websocket.remote_address[0]
     cx, cy = get_cursor_pos()
-    print(f"\n[+] Phone connected from: {client_ip} | Starting cursor pos: ({cx}, {cy})", flush=True)
+    print(f"\n[+] Phone connected from: {client_ip} | Cursor at: ({cx}, {cy})", flush=True)
     try:
         async for raw in websocket:
             try:
@@ -117,11 +121,11 @@ async def main():
     host = "0.0.0.0"
     cx, cy = get_cursor_pos()
     print("=" * 60, flush=True)
-    print(f"AirMouse Server running on ws://0.0.0.0:{port}", flush=True)
-    print(f"Attached to interactive desktop. Cursor at: ({cx}, {cy})", flush=True)
+    print(f"AirMouse Ultra-Low Latency Server on ws://0.0.0.0:{port}", flush=True)
+    print(f"Connected to Windows desktop. Current cursor: ({cx}, {cy})", flush=True)
     print("Waiting for phone to connect...", flush=True)
     print("=" * 60, flush=True)
-    async with websockets.serve(handler, host, port):
+    async with websockets.serve(handler, host, port, ping_interval=None, ping_timeout=None):
         await asyncio.Future()
 
 if __name__ == "__main__":
