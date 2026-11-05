@@ -9,8 +9,8 @@ android {
         applicationId = "com.example.airmouse"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "2.1"
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }

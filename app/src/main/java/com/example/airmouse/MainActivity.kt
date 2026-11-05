@@ -11,6 +11,7 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.*
 import android.provider.Settings
 import android.text.InputType
@@ -22,38 +23,94 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.math.*
+
+// ============================================================================
+// 1€ FILTER (ONE EURO FILTER) - ADAPTIVE JITTER & LATENCY SUPPRESSION
+// Casiez et al., CHI 2012: Dynamic cutoff based on instantaneous velocity
+// ============================================================================
+class LowPassFilter(private var s: Float = 0f, var initialized: Boolean = false) {
+    fun filter(value: Float, alpha: Float): Float {
+        val result = if (initialized) alpha * value + (1f - alpha) * s else value
+        s = result
+        initialized = true
+        return result
+    }
+    fun value(): Float = s
+    fun reset() { initialized = false }
+}
+
+class OneEuroFilter(
+    private val minCutoff: Float = 1.0f,  // Low speed cutoff (Hz): stops micro hand-tremor
+    private val beta: Float = 0.05f,      // Speed coefficient: eliminates lag during flicks
+    private val dCutoff: Float = 1.0f     // Derivative cutoff (Hz)
+) {
+    private val xFilter = LowPassFilter()
+    private val dxFilter = LowPassFilter()
+    private var lastTime = -1L
+
+    private fun getAlpha(rate: Float, cutoff: Float): Float {
+        val tau = 1.0f / (2.0f * Math.PI.toFloat() * cutoff)
+        val te = 1.0f / rate
+        return 1.0f / (1.0f + tau / te)
+    }
+
+    fun filter(value: Float, timestampNs: Long): Float {
+        if (lastTime == -1L) {
+            lastTime = timestampNs
+            return xFilter.filter(value, 1f)
+        }
+        val dt = ((timestampNs - lastTime) / 1e9f).coerceIn(0.0005f, 0.05f)
+        lastTime = timestampNs
+        val rate = 1.0f / dt
+
+        val prevX = if (xFilter.initialized) xFilter.value() else value
+        val dx = (value - prevX) * rate
+        val edx = dxFilter.filter(dx, getAlpha(rate, dCutoff))
+
+        val cutoff = minCutoff + beta * abs(edx)
+        return xFilter.filter(value, getAlpha(rate, cutoff))
+    }
+
+    fun reset() {
+        lastTime = -1L
+        xFilter.reset()
+        dxFilter.reset()
+    }
+}
 
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        const val APP_VERSION_CODE = 2
-        const val APP_VERSION_NAME = "2.0"
+        const val APP_VERSION_CODE = 3
+        const val APP_VERSION_NAME = "2.1"
     }
 
-    // Tuning & Multipliers
-    private val gyroPxPerRad = 1600f
+    // Motion Tuning
+    private val gyroPxPerRad = 1750f
     private val gyroScrollPerRad = 45f
-    private val deadzone = 0.012f
+
+    // One Euro Filters for X (pitch) and Z (yaw)
+    private val filterGx = OneEuroFilter(minCutoff = 1.2f, beta = 0.06f)
+    private val filterGz = OneEuroFilter(minCutoff = 1.2f, beta = 0.06f)
 
     private var currentSensitivity = 1.0f
     private var isTouchpadMode = false
-
-    // Gyro State
-    private var smoothGx = 0f
-    private var smoothGz = 0f
     private var lastGyroTs = 0L
 
-    // Network & Hardware
+    // Network & Wi-Fi Lock
     private val client = OkHttpClient.Builder().pingInterval(10, TimeUnit.SECONDS).build()
     private var ws: WebSocket? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var sm: SensorManager
     private lateinit var vibrator: Vibrator
 
-    // UI Elements
+    // UI Elements (Nothing Phone Aesthetic)
     private lateinit var statusText: TextView
+    private lateinit var statusDot: TextView
     private lateinit var connectView: LinearLayout
     private lateinit var mainHubView: LinearLayout
     private lateinit var gyroContainer: LinearLayout
@@ -70,7 +127,6 @@ class MainActivity : Activity(), SensorEventListener {
     @Volatile private var gyroPaused = false
     private var dragging = false
 
-    // Track latest PC server address for updates
     private var serverIp = "192.168.0.107"
     private var pendingApkUrl: String? = null
 
@@ -86,73 +142,84 @@ class MainActivity : Activity(), SensorEventListener {
             getSystemService(VIBRATOR_SERVICE) as Vibrator
         }
 
-        val prefs = getSharedPreferences("air_cyber", MODE_PRIVATE)
+        val prefs = getSharedPreferences("air_nothing", MODE_PRIVATE)
         currentSensitivity = prefs.getFloat("sensitivity", 1.0f)
         serverIp = prefs.getString("ip", "192.168.0.107") ?: "192.168.0.107"
 
-        // Root View with Dark Void Cyberpunk aesthetic
+        // Pure Pitch Black Nothing OS Background
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#090B10"))
-            setPadding(dp(14), dp(22), dp(14), dp(14))
+            setBackgroundColor(Color.BLACK)
+            setPadding(dp(16), dp(24), dp(16), dp(16))
         }
 
-        // Top Cyber HUD Status Bar
-        val hudCard = LinearLayout(this).apply {
+        // ==========================================
+        // NOTHING OS: TOP HUD WIDGET
+        // ==========================================
+        val topWidget = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = cyberCard(Color.parseColor("#10141E"), Color.parseColor("#1E2638"), dp(12))
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = nothingCard(Color.parseColor("#121212"), Color.parseColor("#262626"), dp(18))
         }
+
+        statusDot = TextView(this).apply {
+            text = "● "
+            setTextColor(Color.parseColor("#D71921")) // Nothing Iconic Red
+            textSize = 12f
+        }
+        topWidget.addView(statusDot)
 
         statusText = TextView(this).apply {
-            setTextColor(Color.parseColor("#00E5FF"))
+            setTextColor(Color.parseColor("#E5E5E5"))
             typeface = Typeface.MONOSPACE
             textSize = 12f
-            text = "● SYSTEM STANDBY // ENTER IP"
+            text = "DISCONNECTED (STANDBY)"
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        hudCard.addView(statusText)
+        topWidget.addView(statusText)
 
-        val pingBtn = TextView(this).apply {
-            text = "⏻ CLOSE"
-            setTextColor(Color.parseColor("#EF4444"))
+        val closeBtn = TextView(this).apply {
+            text = "( DISCONNECT )"
+            setTextColor(Color.parseColor("#737373"))
             textSize = 11f
             typeface = Typeface.MONOSPACE
-            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setPadding(dp(6), dp(4), dp(6), dp(4))
             setOnClickListener {
                 haptic(20)
                 ws?.close(1000, "User close")
-                dropConnection("Disconnected by user")
+                dropConnection("DISCONNECTED")
             }
         }
-        hudCard.addView(pingBtn)
-        root.addView(hudCard)
+        topWidget.addView(closeBtn)
+        root.addView(topWidget)
 
-        // --- OTA FIRMWARE UPDATE BANNER (Auto-hidden until update detected) ---
+        // ==========================================
+        // NOTHING OS: FIRMWARE UPDATE PILL
+        // ==========================================
         updateBanner = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             visibility = View.GONE
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            background = cyberCard(Color.parseColor("#2D1B4E"), Color.parseColor("#A855F7"), dp(10))
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            background = nothingCard(Color.parseColor("#1C1012"), Color.parseColor("#D71921"), dp(14))
             layoutParams = LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(8)
+                topMargin = dp(10)
             }
         }
         updateBannerText = TextView(this).apply {
-            text = "▲ FIRMWARE UPDATE AVAILABLE"
-            setTextColor(Color.parseColor("#F3E8FF"))
+            text = "FIRMWARE UPDATE READY"
+            setTextColor(Color.WHITE)
             typeface = Typeface.MONOSPACE
             textSize = 11f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         updateBannerBtn = TextView(this).apply {
-            text = "[ FLASH UPDATE ]"
-            setTextColor(Color.parseColor("#00E5FF"))
-            typeface = Typeface.MONOSPACE
-            textSize = 11f
-            setPadding(dp(6), dp(4), dp(6), dp(4))
+            text = "[ FLASH ]"
+            setTextColor(Color.parseColor("#D71921"))
+            typeface = Typeface.DEFAULT_BOLD
+            textSize = 12f
+            setPadding(dp(8), dp(4), dp(8), dp(4))
             setOnClickListener {
                 pendingApkUrl?.let { url -> downloadAndInstallUpdate(url) }
             }
@@ -162,7 +229,7 @@ class MainActivity : Activity(), SensorEventListener {
         root.addView(updateBanner)
 
         // ==========================================
-        // 1. CONNECT VIEW
+        // VIEW 1: CONNECT SCREEN (NOTHING MINIMAL)
         // ==========================================
         connectView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -170,42 +237,57 @@ class MainActivity : Activity(), SensorEventListener {
             layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
         }
 
-        val logoBadge = TextView(this).apply {
-            text = "AIRMOUSE // CYBER"
-            setTextColor(Color.parseColor("#00E5FF"))
+        val dotMatrixTitle = TextView(this).apply {
+            text = "( AIR_MOUSE // N•01 )"
+            setTextColor(Color.WHITE)
             typeface = Typeface.MONOSPACE
-            textSize = 24f
+            textSize = 22f
             gravity = Gravity.CENTER
             setPadding(0, 0, 0, dp(6))
         }
-        val subBadge = TextView(this).apply {
-            text = "NEURAL INPUT LINK v$APP_VERSION_NAME"
-            setTextColor(Color.parseColor("#64748B"))
+        val dotMatrixSubtitle = TextView(this).apply {
+            text = "DOT_ENGINE V$APP_VERSION_NAME • ULTRA_LOW_LATENCY"
+            setTextColor(Color.parseColor("#666666"))
             typeface = Typeface.MONOSPACE
-            textSize = 12f
+            textSize = 11f
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, dp(24))
+            setPadding(0, 0, 0, dp(32))
         }
-        connectView.addView(logoBadge)
-        connectView.addView(subBadge)
+        connectView.addView(dotMatrixTitle)
+        connectView.addView(dotMatrixSubtitle)
 
+        val ipCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            padding(16)
+            background = nothingCard(Color.parseColor("#141414"), Color.parseColor("#2B2B2B"), dp(20))
+            layoutParams = LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+
+        val ipLabel = TextView(this).apply {
+            text = "TARGET PC IP ADDRESS"
+            setTextColor(Color.parseColor("#888888"))
+            typeface = Typeface.MONOSPACE
+            textSize = 11f
+            setPadding(0, 0, 0, dp(8))
+        }
         val ipField = EditText(this).apply {
             hint = "192.168.0.xxx"
             setText(serverIp)
             setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#475569"))
-            textSize = 20f
+            setHintTextColor(Color.parseColor("#444444"))
+            textSize = 22f
             typeface = Typeface.MONOSPACE
             gravity = Gravity.CENTER
             inputType = InputType.TYPE_CLASS_TEXT
-            setPadding(dp(16), dp(16), dp(16), dp(16))
-            background = cyberCard(Color.parseColor("#10141E"), Color.parseColor("#00E5FF"), dp(12))
-            layoutParams = LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = nothingCard(Color.parseColor("#0A0A0A"), Color.parseColor("#262626"), dp(12))
         }
-        connectView.addView(ipField)
+        ipCard.addView(ipLabel)
+        ipCard.addView(ipField)
+        connectView.addView(ipCard)
 
-        val connectBtn = cyberButton("⚡ ESTABLISH LINK", Color.parseColor("#00E5FF"), Color.parseColor("#061325")).apply {
-            layoutParams = LinearLayout.LayoutParams(-1, dp(58)).apply { topMargin = dp(18) }
+        val connectBtn = nothingButton("CONNECT TO PC", Color.WHITE, Color.parseColor("#1A1A1A"), Color.WHITE).apply {
+            layoutParams = LinearLayout.LayoutParams(-1, dp(58)).apply { topMargin = dp(20) }
             setOnClickListener {
                 val ip = ipField.text.toString().trim()
                 if (ip.isEmpty()) return@setOnClickListener
@@ -219,7 +301,7 @@ class MainActivity : Activity(), SensorEventListener {
         root.addView(connectView)
 
         // ==========================================
-        // 2. MAIN ACTIVE HUB (MODES + CONTROLS)
+        // VIEW 2: ACTIVE CONTROL HUB
         // ==========================================
         mainHubView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -227,33 +309,33 @@ class MainActivity : Activity(), SensorEventListener {
             layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
         }
 
-        // Mode Segment Switcher Bar
+        // Nothing OS Pill Segment Switcher
         val modeSwitcher = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            background = cyberCard(Color.parseColor("#0E121B"), Color.parseColor("#1E2638"), dp(12))
+            background = nothingCard(Color.parseColor("#121212"), Color.parseColor("#242424"), dp(24))
             setPadding(dp(4), dp(4), dp(4), dp(4))
             layoutParams = LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(8)
-                bottomMargin = dp(6)
+                topMargin = dp(10)
+                bottomMargin = dp(8)
             }
         }
 
         gyroTabBtn = TextView(this).apply {
-            text = "🛰️ GYRO AIR"
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
+            text = "GYRO AIR"
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
             gravity = Gravity.CENTER
-            setPadding(0, dp(10), 0, dp(10))
+            setPadding(0, dp(12), 0, dp(12))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             setOnClickListener { switchMode(false) }
         }
 
         touchpadTabBtn = TextView(this).apply {
-            text = "🔲 TOUCHPAD"
-            textSize = 13f
-            typeface = Typeface.DEFAULT_BOLD
+            text = "TOUCHPAD"
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
             gravity = Gravity.CENTER
-            setPadding(0, dp(10), 0, dp(10))
+            setPadding(0, dp(12), 0, dp(12))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             setOnClickListener { switchMode(true) }
         }
@@ -262,38 +344,36 @@ class MainActivity : Activity(), SensorEventListener {
         modeSwitcher.addView(touchpadTabBtn)
         mainHubView.addView(modeSwitcher)
 
-        // HUD Info Ribbon
         modeBadge = TextView(this).apply {
-            text = "ENGINE: GYRO REMOTE // VOL KEYS: CLICK"
-            setTextColor(Color.parseColor("#38BDF8"))
+            text = "• 1€ ADAPTIVE FILTER ACTIVE  |  VOL KEYS: CLICK"
+            setTextColor(Color.parseColor("#888888"))
             typeface = Typeface.MONOSPACE
-            textSize = 11f
+            textSize = 10f
             gravity = Gravity.CENTER
-            setPadding(0, dp(2), 0, dp(6))
+            setPadding(0, 0, 0, dp(8))
         }
         mainHubView.addView(modeBadge)
 
-        // Mode Container 1: GYRO AIR REMOTE
+        // Mode Containers
         gyroContainer = createGyroInterface()
         mainHubView.addView(gyroContainer)
 
-        // Mode Container 2: CYBER TOUCHPAD
         touchpadContainer = createTouchpadInterface()
         touchpadContainer.visibility = View.GONE
         mainHubView.addView(touchpadContainer)
 
-        // Sensitivity Slider Footer
-        val sliderBox = LinearLayout(this).apply {
+        // Minimalist Sensitivity Widget (Nothing Style)
+        val sliderCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            background = cyberCard(Color.parseColor("#0E121A"), Color.parseColor("#1A2234"), dp(10))
+            padding(12)
+            background = nothingCard(Color.parseColor("#111111"), Color.parseColor("#222222"), dp(16))
             layoutParams = LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                topMargin = dp(6)
+                topMargin = dp(8)
             }
         }
         val sensTitle = TextView(this).apply {
-            text = "SENSITIVITY: ${"%.1f".format(currentSensitivity)}x"
-            setTextColor(Color.parseColor("#94A3B8"))
+            text = "SENSITIVITY // ${"%.1f".format(currentSensitivity)}X"
+            setTextColor(Color.parseColor("#A3A3A3"))
             typeface = Typeface.MONOSPACE
             textSize = 11f
             gravity = Gravity.CENTER
@@ -304,26 +384,25 @@ class MainActivity : Activity(), SensorEventListener {
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
                     currentSensitivity = 0.5f + (p / 200f) * 2.0f
-                    sensTitle.text = "SENSITIVITY: ${"%.1f".format(currentSensitivity)}x"
+                    sensTitle.text = "SENSITIVITY // ${"%.1f".format(currentSensitivity)}X"
                     prefs.edit().putFloat("sensitivity", currentSensitivity).apply()
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) { haptic(12) }
             })
         }
-        sliderBox.addView(sensTitle)
-        sliderBox.addView(sensBar)
-        mainHubView.addView(sliderBox)
+        sliderCard.addView(sensTitle)
+        sliderCard.addView(sensBar)
+        mainHubView.addView(sliderCard)
 
         root.addView(mainHubView)
         setContentView(root)
 
-        // Initialize Tab Appearance
         updateTabStyles()
     }
 
     // ==========================================
-    // UI BUILDER: GYRO AIR INTERFACE
+    // NOTHING OS: GYRO AIR REMOTE UI
     // ==========================================
     private fun createGyroInterface(): LinearLayout {
         val layout = LinearLayout(this).apply {
@@ -331,25 +410,24 @@ class MainActivity : Activity(), SensorEventListener {
             layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
         }
 
-        val leftPad = cyberPad("LEFT CLICK\n[ TAP / HOLD DRAG ]", Color.parseColor("#00E5FF"), Color.parseColor("#111827"))
-        val rightPad = cyberPad("RIGHT CLICK", Color.parseColor("#A855F7"), Color.parseColor("#111827"))
-        val scrollPad = cyberPad("HOLD + TILT\nSCROLL", Color.parseColor("#38BDF8"), Color.parseColor("#111827"))
-        val freezePad = cyberPad("HOLD TO FREEZE CURSOR", Color.parseColor("#64748B"), Color.parseColor("#1E293B"))
+        val leftPad = nothingPad("LEFT CLICK\n( TAP / HOLD DRAG )", Color.WHITE, Color.parseColor("#161616"), Color.parseColor("#333333"), dp(20))
+        val rightPad = nothingPad("RIGHT CLICK", Color.WHITE, Color.parseColor("#161616"), Color.parseColor("#333333"), dp(18))
+        val scrollPad = nothingPad("HOLD + TILT\nSCROLL", Color.WHITE, Color.parseColor("#161616"), Color.parseColor("#333333"), dp(18))
+        val freezePad = nothingPad("HOLD TO FREEZE CURSOR", Color.parseColor("#888888"), Color.parseColor("#0D0D0D"), Color.parseColor("#222222"), dp(16))
 
-        layout.addView(leftPad, LinearLayout.LayoutParams(-1, 0, 2.5f).apply { bottomMargin = dp(6) })
+        layout.addView(leftPad, LinearLayout.LayoutParams(-1, 0, 2.5f).apply { bottomMargin = dp(8) })
 
         val midRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         midRow.addView(rightPad, LinearLayout.LayoutParams(0, -1, 1f).apply { marginEnd = dp(4) })
         midRow.addView(scrollPad, LinearLayout.LayoutParams(0, -1, 1f).apply { marginStart = dp(4) })
-        layout.addView(midRow, LinearLayout.LayoutParams(-1, 0, 1.2f).apply { bottomMargin = dp(6) })
+        layout.addView(midRow, LinearLayout.LayoutParams(-1, 0, 1.2f).apply { bottomMargin = dp(8) })
 
         layout.addView(freezePad, LinearLayout.LayoutParams(-1, 0, 1.0f))
 
-        // Left Click & Drag Touch Logic
         val dragStart = Runnable {
             dragging = true
             haptic(35)
-            send { put("t", "down"); put("b", "left") }
+            sendRaw("d l")
         }
         bindTouch(leftPad, {
             haptic(16)
@@ -359,16 +437,16 @@ class MainActivity : Activity(), SensorEventListener {
             if (dragging) {
                 dragging = false
                 haptic(16)
-                send { put("t", "up"); put("b", "left") }
+                sendRaw("u l")
             } else {
                 haptic(22)
-                send { put("t", "click"); put("b", "left") }
+                sendRaw("c l")
             }
         })
 
         bindTouch(rightPad, {
             haptic(22)
-            send { put("t", "click"); put("b", "right") }
+            sendRaw("c r")
         }, {})
 
         bindTouch(scrollPad, {
@@ -389,7 +467,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // UI BUILDER: CYBER TOUCHPAD INTERFACE
+    // NOTHING OS: PRECISION TOUCHPAD UI
     // ==========================================
     @SuppressLint("ClickableViewAccessibility")
     private fun createTouchpadInterface(): LinearLayout {
@@ -398,16 +476,14 @@ class MainActivity : Activity(), SensorEventListener {
             layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
         }
 
-        // Futuristic Trackpad Area
         val trackpadSurface = FrameLayout(this).apply {
-            background = cyberCard(Color.parseColor("#0C1019"), Color.parseColor("#00E5FF"), dp(16))
-            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = dp(6) }
+            background = nothingCard(Color.parseColor("#0C0C0C"), Color.parseColor("#2B2B2B"), dp(22))
+            layoutParams = LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = dp(8) }
         }
 
-        // Tech visual crosshair markings in trackpad
         val label = TextView(this).apply {
-            text = "+  +  +  TOUCHPAD ACTIVE  +  +  +\n1 FINGER: MOVE  |  2 FINGER: SCROLL"
-            setTextColor(Color.parseColor("#334155"))
+            text = "+       ·       +\n\nTOUCHPAD\n1-FINGER: MOVE  |  2-FINGER: SCROLL\n\n+       ·       +"
+            setTextColor(Color.parseColor("#404040"))
             typeface = Typeface.MONOSPACE
             textSize = 10f
             gravity = Gravity.CENTER
@@ -415,7 +491,6 @@ class MainActivity : Activity(), SensorEventListener {
         }
         trackpadSurface.addView(label)
 
-        // Gesture Detection variables for Touchpad
         var prevX = 0f
         var prevY = 0f
         var touchDownTime = 0L
@@ -447,32 +522,30 @@ class MainActivity : Activity(), SensorEventListener {
                         val dy = (currentScrollY - prevScrollY) * 0.12f * currentSensitivity
                         prevScrollY = currentScrollY
                         if (abs(dy) > 0.05f) {
-                            send { put("t", "scroll"); put("dy", dy.toDouble()) }
+                            sendRaw("s ${"%.3f".format(Locale.US, dy)}")
                         }
                     } else if (!isTwoFinger && pCount == 1) {
-                        val dx = (event.x - prevX) * 1.6f * currentSensitivity
-                        val dy = (event.y - prevY) * 1.6f * currentSensitivity
+                        val dx = (event.x - prevX) * 1.55f * currentSensitivity
+                        val dy = (event.y - prevY) * 1.55f * currentSensitivity
                         prevX = event.x
                         prevY = event.y
                         if (abs(dx) > 0.01f || abs(dy) > 0.01f) {
-                            send { put("t", "move"); put("dx", dx.toDouble()); put("dy", dy.toDouble()) }
+                            sendRaw("m ${"%.3f".format(Locale.US, dx)} ${"%.3f".format(Locale.US, dy)}")
                         }
                     }
                 }
                 MotionEvent.ACTION_POINTER_UP -> {
                     if (isTwoFinger && (SystemClock.uptimeMillis() - touchDownTime) < 260) {
-                        // Two finger tap = Right click
                         haptic(25)
-                        send { put("t", "click"); put("b", "right") }
+                        sendRaw("c r")
                     }
                 }
                 MotionEvent.ACTION_UP -> {
                     val duration = SystemClock.uptimeMillis() - touchDownTime
                     val dist = hypot(event.x - touchStartX, event.y - touchStartY)
-                    if (!isTwoFinger && duration < 240 && dist < dp(12)) {
-                        // Single finger tap = Left click
+                    if (!isTwoFinger && duration < 240 && dist < dp(14)) {
                         haptic(20)
-                        send { put("t", "click"); put("b", "left") }
+                        sendRaw("c l")
                     }
                 }
             }
@@ -480,23 +553,23 @@ class MainActivity : Activity(), SensorEventListener {
         }
         layout.addView(trackpadSurface)
 
-        // Physical Touchpad Buttons at bottom (Left Click / Right Click zones)
+        // Bottom Physical Buttons (Nothing Pill Style)
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(-1, dp(64))
         }
 
-        val padLeft = cyberPad("LEFT CLICK", Color.parseColor("#00E5FF"), Color.parseColor("#111726"))
-        val padRight = cyberPad("RIGHT CLICK", Color.parseColor("#A855F7"), Color.parseColor("#111726"))
+        val padLeft = nothingPad("LEFT CLICK", Color.WHITE, Color.parseColor("#151515"), Color.parseColor("#2A2A2A"), dp(18))
+        val padRight = nothingPad("RIGHT CLICK", Color.WHITE, Color.parseColor("#151515"), Color.parseColor("#2A2A2A"), dp(18))
 
         bindTouch(padLeft, {
             haptic(20)
-            send { put("t", "click"); put("b", "left") }
+            sendRaw("c l")
         }, {})
 
         bindTouch(padRight, {
             haptic(20)
-            send { put("t", "click"); put("b", "right") }
+            sendRaw("c r")
         }, {})
 
         btnRow.addView(padLeft, LinearLayout.LayoutParams(0, -1, 1f).apply { marginEnd = dp(4) })
@@ -517,43 +590,68 @@ class MainActivity : Activity(), SensorEventListener {
         if (isTouchpadMode) {
             gyroContainer.visibility = View.GONE
             touchpadContainer.visibility = View.VISIBLE
-            modeBadge.text = "ENGINE: PRECISION TOUCHPAD // 2-FINGER SCROLL"
+            modeBadge.text = "• TOUCHPAD ACTIVE  |  2-FINGER SCROLL"
         } else {
             touchpadContainer.visibility = View.GONE
             gyroContainer.visibility = View.VISIBLE
-            modeBadge.text = "ENGINE: GYRO REMOTE // VOL KEYS: CLICK"
+            modeBadge.text = "• 1€ ADAPTIVE FILTER ACTIVE  |  VOL KEYS: CLICK"
+            filterGx.reset()
+            filterGz.reset()
         }
         updateTabStyles()
     }
 
     private fun updateTabStyles() {
         if (isTouchpadMode) {
-            touchpadTabBtn.background = cyberCard(Color.parseColor("#1E293B"), Color.parseColor("#00E5FF"), dp(8))
-            touchpadTabBtn.setTextColor(Color.parseColor("#00E5FF"))
+            touchpadTabBtn.background = nothingCard(Color.WHITE, Color.WHITE, dp(20))
+            touchpadTabBtn.setTextColor(Color.BLACK)
             gyroTabBtn.background = null
-            gyroTabBtn.setTextColor(Color.parseColor("#64748B"))
+            gyroTabBtn.setTextColor(Color.parseColor("#737373"))
         } else {
-            gyroTabBtn.background = cyberCard(Color.parseColor("#1E293B"), Color.parseColor("#00E5FF"), dp(8))
-            gyroTabBtn.setTextColor(Color.parseColor("#00E5FF"))
+            gyroTabBtn.background = nothingCard(Color.WHITE, Color.WHITE, dp(20))
+            gyroTabBtn.setTextColor(Color.BLACK)
             touchpadTabBtn.background = null
-            touchpadTabBtn.setTextColor(Color.parseColor("#64748B"))
+            touchpadTabBtn.setTextColor(Color.parseColor("#737373"))
         }
     }
 
     // ==========================================
-    // NETWORK & WEBSOCKET ENGINE
+    // ULTRA-LOW LATENCY NETWORK & WI-FI LOCK
     // ==========================================
+    private fun acquireWifiLock() {
+        try {
+            val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+            wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "AirMouse:LowLatency")
+            } else {
+                @Suppress("DEPRECATION")
+                wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "AirMouse:HighPerf")
+            }
+            wifiLock?.setReferenceCounted(false)
+            wifiLock?.acquire()
+        } catch (_: Exception) {}
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (_: Exception) {}
+    }
+
     private fun connectToServer(ip: String) {
-        statusText.text = "CONNECTING // $ip:8080..."
+        statusText.text = "CONNECTING ($ip)..."
+        statusDot.setTextColor(Color.parseColor("#EAB308")) // Amber connecting
         ws?.cancel()
         ws = client.newWebSocket(Request.Builder().url("ws://$ip:8080").build(), object : WebSocketListener() {
             override fun onOpen(w: WebSocket, r: Response) = runOnUiThread {
                 connected = true
                 lastGyroTs = 0L
-                smoothGx = 0f
-                smoothGz = 0f
+                filterGx.reset()
+                filterGz.reset()
+                acquireWifiLock()
                 haptic(50)
-                statusText.text = "● LINK ACTIVE // $ip"
+                statusDot.setTextColor(Color.parseColor("#22C55E")) // Green connected
+                statusText.text = "CONNECTED // $ip"
                 connectView.visibility = View.GONE
                 mainHubView.visibility = View.VISIBLE
             }
@@ -567,7 +665,7 @@ class MainActivity : Activity(), SensorEventListener {
                         if (serverVersionCode > APP_VERSION_CODE && apkUrl.isNotEmpty()) {
                             runOnUiThread {
                                 pendingApkUrl = apkUrl
-                                updateBannerText.text = "▲ FIRMWARE v${msg.optString("versionName", "NEW")} AVAILABLE"
+                                updateBannerText.text = "FIRMWARE V${msg.optString("versionName", "NEW")} AVAILABLE"
                                 updateBanner.visibility = View.VISIBLE
                                 haptic(40)
                             }
@@ -577,28 +675,30 @@ class MainActivity : Activity(), SensorEventListener {
             }
 
             override fun onFailure(w: WebSocket, t: Throwable, r: Response?) = runOnUiThread {
-                dropConnection("LINK FAILURE: ${t.localizedMessage ?: t.message}")
+                dropConnection("ERROR: ${t.localizedMessage ?: t.message}")
             }
 
             override fun onClosed(w: WebSocket, code: Int, reason: String) = runOnUiThread {
-                dropConnection("LINK SEVERED")
+                dropConnection("DISCONNECTED")
             }
         })
     }
 
     private fun dropConnection(msg: String) {
         connected = false
-        statusText.text = "● $msg"
+        releaseWifiLock()
+        statusDot.setTextColor(Color.parseColor("#D71921")) // Nothing Red
+        statusText.text = msg
         connectView.visibility = View.VISIBLE
         mainHubView.visibility = View.GONE
     }
 
     // ==========================================
-    // IN-APP AUTO-UPDATER ENGINE (OTA FLASH)
+    // OTA UPDATE ENGINE
     // ==========================================
     private fun downloadAndInstallUpdate(downloadUrl: String) {
         haptic(25)
-        updateBannerBtn.text = "[ DOWNLOADING... ]"
+        updateBannerBtn.text = "[ ... ]"
         updateBannerBtn.isEnabled = false
 
         Thread {
@@ -609,9 +709,7 @@ class MainActivity : Activity(), SensorEventListener {
                 conn.readTimeout = 15000
                 conn.connect()
 
-                if (conn.responseCode != 200) {
-                    throw Exception("HTTP ${conn.responseCode}")
-                }
+                if (conn.responseCode != 200) throw Exception("HTTP ${conn.responseCode}")
 
                 val totalLen = conn.contentLength
                 val apkFile = File(cacheDir, "update.apk")
@@ -636,7 +734,7 @@ class MainActivity : Activity(), SensorEventListener {
                 input.close()
 
                 ui.post {
-                    updateBannerText.text = "VERIFIED // OPENING INSTALLER"
+                    updateBannerText.text = "VERIFIED (OPENING INSTALLER)"
                     updateBannerBtn.text = "[ READY ]"
                     triggerApkInstall(apkFile)
                 }
@@ -651,7 +749,6 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private fun triggerApkInstall(apkFile: File) {
-        // Check Unknown Sources Permission for Android O+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (!packageManager.canRequestPackageInstalls()) {
                 val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
@@ -671,7 +768,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // HARDWARE VOLUME BUTTON CLICK TRIGGERS
+    // HARDWARE VOLUME BUTTON CLICKS
     // ==========================================
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         if (connected && mainHubView.visibility == View.VISIBLE) {
@@ -679,13 +776,13 @@ class MainActivity : Activity(), SensorEventListener {
                 if (event?.repeatCount == 0) {
                     haptic(24)
                     dragging = true
-                    send { put("t", "down"); put("b", "left") }
+                    sendRaw("d l")
                 }
                 return true
             } else if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
                 if (event?.repeatCount == 0) {
                     haptic(24)
-                    send { put("t", "click"); put("b", "right") }
+                    sendRaw("c r")
                 }
                 return true
             }
@@ -699,10 +796,10 @@ class MainActivity : Activity(), SensorEventListener {
                 if (dragging) {
                     dragging = false
                     haptic(16)
-                    send { put("t", "up"); put("b", "left") }
+                    sendRaw("u l")
                 } else {
                     haptic(20)
-                    send { put("t", "click"); put("b", "left") }
+                    sendRaw("c l")
                 }
                 return true
             } else if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
@@ -713,46 +810,34 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     // ==========================================
-    // GYRO SENSOR ENGINE (ANTI-TREMOR + BALLISTICS)
+    // 200HZ SENSOR LOOP + 1€ FILTER EXECUTION
     // ==========================================
-    private fun softDeadzone(v: Float, threshold: Float): Float {
-        val a = abs(v)
-        if (a <= threshold) return 0f
-        return (v / a) * (a - threshold)
-    }
-
     override fun onSensorChanged(e: SensorEvent) {
         if (!connected || isTouchpadMode) return
-        if (lastGyroTs == 0L) { lastGyroTs = e.timestamp; return }
-        val dt = ((e.timestamp - lastGyroTs) / 1e9f).coerceIn(0.001f, 0.05f)
-        lastGyroTs = e.timestamp
+        val now = e.timestamp
+        if (lastGyroTs == 0L) { lastGyroTs = now; return }
+        val dt = ((now - lastGyroTs) / 1e9f).coerceIn(0.0005f, 0.05f)
+        lastGyroTs = now
         if (gyroPaused) return
 
-        val rawGx = softDeadzone(e.values[0], deadzone)
-        val rawGz = softDeadzone(e.values[2], deadzone)
-
-        val angularSpeed = sqrt(rawGx * rawGx + rawGz * rawGz)
-        val alpha = (0.35f + 0.60f * (angularSpeed / 0.8f).coerceIn(0f, 1f))
-        smoothGx += alpha * (rawGx - smoothGx)
-        smoothGz += alpha * (rawGz - smoothGz)
+        // Run through 1€ Filter (Eliminates micro hand tremor while preserving flick speed)
+        val filteredGx = filterGx.filter(e.values[0], now)
+        val filteredGz = filterGz.filter(e.values[2], now)
 
         if (gyroScrolling) {
-            if (abs(smoothGx) > 0.002f) {
-                send {
-                    put("t", "scroll")
-                    put("dy", (-smoothGx * dt * gyroScrollPerRad * currentSensitivity).toDouble())
-                }
+            if (abs(filteredGx) > 0.005f) {
+                val scrollDy = (-filteredGx * dt * gyroScrollPerRad * currentSensitivity).toDouble()
+                sendRaw("s ${"%.3f".format(Locale.US, scrollDy)}")
             }
         } else {
-            val speed = sqrt(smoothGx * smoothGx + smoothGz * smoothGz)
-            if (speed > 0.002f) {
-                val accel = (0.6f + 2.0f * (speed / 1.6f).toDouble().pow(1.3).toFloat()).coerceIn(0.6f, 2.8f)
+            val speed = sqrt(filteredGx * filteredGx + filteredGz * filteredGz)
+            if (speed > 0.005f) {
+                // Adaptive velocity acceleration curve
+                val accel = (0.7f + 2.0f * (speed / 1.6f).toDouble().pow(1.3).toFloat()).coerceIn(0.6f, 2.8f)
                 val mult = gyroPxPerRad * currentSensitivity * accel
-                send {
-                    put("t", "move")
-                    put("dx", (-smoothGz * dt * mult).toDouble())
-                    put("dy", (-smoothGx * dt * mult).toDouble())
-                }
+                val dx = -filteredGz * dt * mult
+                val dy = -filteredGx * dt * mult
+                sendRaw("m ${"%.3f".format(Locale.US, dx)} ${"%.3f".format(Locale.US, dy)}")
             }
         }
     }
@@ -761,44 +846,54 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onResume() {
         super.onResume()
-        sm.registerListener(this, sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE), SensorManager.SENSOR_DELAY_GAME)
+        // Register sensor at FASTEST possible hardware rate (~200Hz)
+        sm.registerListener(this, sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE), SensorManager.SENSOR_DELAY_FASTEST)
     }
 
     override fun onPause() {
         super.onPause()
         sm.unregisterListener(this)
+        releaseWifiLock()
     }
 
     override fun onDestroy() {
         super.onDestroy()
         ws?.close(1000, null)
+        releaseWifiLock()
     }
 
     // ==========================================
-    // UI STYLING & HELPERS
+    // WIRE PROTOCOL (COMPACT TOKENS)
     // ==========================================
-    private fun cyberCard(bgColor: Int, strokeColor: Int, radiusDp: Int) = GradientDrawable().apply {
+    private fun sendRaw(rawText: String) {
+        ws?.send(rawText)
+    }
+
+    // ==========================================
+    // NOTHING OS STYLING HELPERS
+    // ==========================================
+    private fun nothingCard(bgColor: Int, strokeColor: Int, radiusDp: Int) = GradientDrawable().apply {
         setColor(bgColor)
         cornerRadius = dp(radiusDp).toFloat()
         setStroke(dp(1), strokeColor)
     }
 
-    private fun cyberButton(text: String, strokeColor: Int, bgColor: Int) = TextView(this).apply {
+    private fun nothingButton(text: String, textColor: Int, bgColor: Int, strokeColor: Int) = TextView(this).apply {
         this.text = text
-        setTextColor(strokeColor)
+        setTextColor(textColor)
         typeface = Typeface.MONOSPACE
-        textSize = 15f
+        textSize = 14f
         gravity = Gravity.CENTER
-        background = cyberCard(bgColor, strokeColor, dp(14))
+        background = nothingCard(bgColor, strokeColor, dp(18))
     }
 
-    private fun cyberPad(text: String, glowColor: Int, bgColor: Int) = TextView(this).apply {
+    private fun nothingPad(text: String, textColor: Int, bgColor: Int, strokeColor: Int, radiusDp: Int) = TextView(this).apply {
         this.text = text
-        setTextColor(Color.WHITE)
-        typeface = Typeface.DEFAULT_BOLD
-        textSize = 15f
+        setTextColor(textColor)
+        typeface = Typeface.MONOSPACE
+        textSize = 13f
         gravity = Gravity.CENTER
-        background = cyberCard(bgColor, glowColor, dp(14))
+        background = nothingCard(bgColor, strokeColor, radiusDp)
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -823,9 +918,6 @@ class MainActivity : Activity(), SensorEventListener {
         } catch (_: Exception) {}
     }
 
-    private fun send(build: JSONObject.() -> Unit) {
-        ws?.send(JSONObject().apply(build).toString())
-    }
-
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    private fun LinearLayout.padding(allDp: Int) = setPadding(dp(allDp), dp(allDp), dp(allDp), dp(allDp))
 }

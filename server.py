@@ -8,11 +8,17 @@ import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import websockets
 
-CURRENT_VERSION_CODE = 2
-CURRENT_VERSION_NAME = "2.0"
+CURRENT_VERSION_CODE = 3
+CURRENT_VERSION_NAME = "2.1"
 
 # Ensure unbuffered console output
 sys.stdout.reconfigure(line_buffering=True)
+
+# Lock Windows Kernel timer resolution to 1ms (eliminates 15.6ms sleep jitter)
+try:
+    ctypes.windll.winmm.timeBeginPeriod(1)
+except Exception:
+    pass
 
 # Windows mouse_event constants
 MOUSEEVENTF_MOVE = 0x0001
@@ -58,7 +64,7 @@ def on_move(dx, dy):
         accum_y -= step_y
         user32.mouse_event(MOUSEEVENTF_MOVE, step_x, step_y, 0, 0)
         move_counter += 1
-        if move_counter % 50 == 0:
+        if move_counter % 80 == 0:
             cx, cy = get_cursor_pos()
             print(f"[Move #{move_counter}] Cursor at ({cx}, {cy})", flush=True)
 
@@ -125,7 +131,6 @@ class OTAHandler(SimpleHTTPRequestHandler):
         self.do_GET()
 
     def log_message(self, format, *args):
-        # suppress default verbose GET logging
         pass
 
 def run_http_ota(port=8081):
@@ -133,7 +138,7 @@ def run_http_ota(port=8081):
     server.serve_forever()
 
 # ==========================================
-# WEBSOCKET ENGINE (PORT 8080)
+# ULTRA-LOW LATENCY WEBSOCKET (PORT 8080)
 # ==========================================
 async def handler(websocket):
     attach_to_default_desktop()
@@ -147,12 +152,10 @@ async def handler(websocket):
 
     client_ip = websocket.remote_address[0]
     cx, cy = get_cursor_pos()
-    print(f"\n[+] Phone connected from: {client_ip} | Cursor at: ({cx}, {cy})", flush=True)
+    print(f"\n[+] Phone connected from: {client_ip} | Starting cursor: ({cx}, {cy})", flush=True)
 
-    # Determine server host IP reachable by phone
     server_ip = "192.168.0.107"
     try:
-        # Get interface IP matching connection
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect((client_ip, 80))
         server_ip = s.getsockname()[0]
@@ -160,7 +163,7 @@ async def handler(websocket):
     except Exception:
         pass
 
-    # Send Version & OTA payload to client
+    # Send init info for OTA updater
     init_payload = json.dumps({
         "t": "init",
         "versionCode": CURRENT_VERSION_CODE,
@@ -174,21 +177,37 @@ async def handler(websocket):
 
     try:
         async for raw in websocket:
-            try:
-                msg = json.loads(raw)
-                action = msg.get("t")
-                if action == "move":
-                    on_move(msg.get("dx", 0), msg.get("dy", 0))
-                elif action == "scroll":
-                    on_scroll(msg.get("dy", 0))
-                elif action == "click":
-                    on_click(msg.get("b", "left"))
-                elif action == "down":
-                    on_down(msg.get("b", "left"))
-                elif action == "up":
-                    on_up(msg.get("b", "left"))
-            except Exception as e:
-                print(f"[!] Parse error: {e}", flush=True)
+            # Fast-path: Raw Compact Wire Protocol tokens (m, s, c, d, u)
+            if raw.startswith("m "):
+                parts = raw[2:].split()
+                if len(parts) == 2:
+                    on_move(parts[0], parts[1])
+            elif raw.startswith("s "):
+                on_scroll(raw[2:])
+            elif raw.startswith("c "):
+                btn = "left" if raw[2:].strip() == "l" else "right"
+                on_click(btn)
+            elif raw.startswith("d "):
+                on_down("left")
+            elif raw.startswith("u "):
+                on_up("left")
+            elif raw.startswith("{"):
+                # JSON fallback
+                try:
+                    msg = json.loads(raw)
+                    action = msg.get("t")
+                    if action == "move":
+                        on_move(msg.get("dx", 0), msg.get("dy", 0))
+                    elif action == "scroll":
+                        on_scroll(msg.get("dy", 0))
+                    elif action == "click":
+                        on_click(msg.get("b", "left"))
+                    elif action == "down":
+                        on_down(msg.get("b", "left"))
+                    elif action == "up":
+                        on_up(msg.get("b", "left"))
+                except Exception as e:
+                    print(f"[!] JSON error: {e}", flush=True)
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -199,16 +218,15 @@ async def main():
     ws_port = 8080
     ota_port = 8081
 
-    # Start OTA HTTP server thread
     ota_thread = threading.Thread(target=run_http_ota, args=(ota_port,), daemon=True)
     ota_thread.start()
 
     cx, cy = get_cursor_pos()
     print("=" * 65, flush=True)
-    print(f"AirMouse Cyber Hybrid Server v{CURRENT_VERSION_NAME}", flush=True)
-    print(f"  ● Input WebSocket   : ws://0.0.0.0:{ws_port}", flush=True)
-    print(f"  ● In-App OTA Flash  : http://0.0.0.0:{ota_port}/AirMouse.apk", flush=True)
-    print(f"  ● Connected Desktop : Interactive (Cursor: {cx}, {cy})", flush=True)
+    print(f"AirMouse Nothing Engine v{CURRENT_VERSION_NAME} (1ms Kernel Timer)")
+    print(f"  ● Input WebSocket   : ws://0.0.0.0:{ws_port}")
+    print(f"  ● In-App OTA Flash  : http://0.0.0.0:{ota_port}/AirMouse.apk")
+    print(f"  ● Interactive Screen: Attached (Cursor: {cx}, {cy})")
     print("Waiting for phone connection...", flush=True)
     print("=" * 65, flush=True)
 
