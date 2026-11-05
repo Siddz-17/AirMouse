@@ -8,8 +8,8 @@ import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import websockets
 
-CURRENT_VERSION_CODE = 12
-CURRENT_VERSION_NAME = "3.0"
+CURRENT_VERSION_CODE = 11
+CURRENT_VERSION_NAME = "2.9"
 
 # Ensure unbuffered console output
 sys.stdout.reconfigure(line_buffering=True)
@@ -244,10 +244,26 @@ async def handler(websocket):
     finally:
         print(f"[-] Phone disconnected: {client_ip}\n", flush=True)
 
+def get_local_ips():
+    ips = []
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    # Sort so 192.168.x or 10.x LAN comes first
+    ips.sort(key=lambda x: (not x.startswith("192.168."), not x.startswith("10."), x))
+    return ips if ips else ["127.0.0.1"]
+
 async def main():
     attach_to_interactive_desktop()
     ws_port = 8080
     ota_port = 8081
+    local_ips = get_local_ips()
+    primary_ip = local_ips[0]
 
     ota_thread = threading.Thread(target=run_http_ota, args=(ota_port,), daemon=True)
     ota_thread.start()
@@ -256,8 +272,11 @@ async def main():
     print("=" * 65, flush=True)
     print(f"AirMouse Nothing Engine v{CURRENT_VERSION_NAME} (1ms Timer + Interactive Desktop)")
     print(f"  Screen       : {SCREEN_W}x{SCREEN_H} (Current cursor: {cx}, {cy})")
-    print(f"  WebSocket    : ws://0.0.0.0:{ws_port}")
-    print(f"  OTA Flash    : http://0.0.0.0:{ota_port}/AirMouse.apk")
+    print(f"  Wi-Fi IP     : {primary_ip}")
+    if len(local_ips) > 1:
+        print(f"  Other IPs    : {', '.join(local_ips[1:])}")
+    print(f"  WebSocket    : ws://{primary_ip}:{ws_port}")
+    print(f"  OTA Flash    : http://{primary_ip}:{ota_port}/AirMouse.apk")
     print("Waiting for phone connection...", flush=True)
     print("=" * 65, flush=True)
 
