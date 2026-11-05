@@ -30,8 +30,8 @@ import kotlin.math.*
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        const val APP_VERSION_CODE = 12
-        const val APP_VERSION_NAME = "3.0"
+        const val APP_VERSION_CODE = 21
+        const val APP_VERSION_NAME = "3.1"
 
         const val MODE_AIR = 0
         const val MODE_TOUCHPAD = 1
@@ -59,6 +59,7 @@ class MainActivity : Activity(), SensorEventListener {
 
     private var currentSensitivity = 0.8f
     private var currentMode = MODE_AIR
+    private var invertY = false
 
     // Sensor Diagnostics & Rate Counters
     private var activeSensorName = "INITIALIZING..."
@@ -127,6 +128,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         val prefs = getSharedPreferences("air_nothing", MODE_PRIVATE)
         currentSensitivity = prefs.getFloat("sensitivity", 0.8f)
+        invertY = prefs.getBoolean("invert_y", false)
         serverIp = prefs.getString("ip", "192.168.0.107") ?: "192.168.0.107"
 
         // Root — pure pitch black Nothing OS background
@@ -162,12 +164,27 @@ class MainActivity : Activity(), SensorEventListener {
         }
         topWidget.addView(statusText)
 
+        val invYBtn = TextView(this).apply {
+            text = if (invertY) "( Y: INV )" else "( Y: NORM )"
+            setTextColor(Color.parseColor("#E5E5E5"))
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setPadding(dp(6), dp(4), dp(6), dp(4))
+            setOnClickListener {
+                invertY = !invertY
+                prefs.edit().putBoolean("invert_y", invertY).apply()
+                text = if (invertY) "( Y: INV )" else "( Y: NORM )"
+                haptic(25)
+            }
+        }
+        topWidget.addView(invYBtn)
+
         val centerBtn = TextView(this).apply {
             text = "( CENTER )"
             setTextColor(Color.parseColor("#E5E5E5"))
             textSize = 11f
             typeface = Typeface.MONOSPACE
-            setPadding(dp(6), dp(4), dp(8), dp(4))
+            setPadding(dp(6), dp(4), dp(6), dp(4))
             setOnClickListener {
                 haptic(30)
                 sendRaw("recenter")
@@ -800,7 +817,7 @@ class MainActivity : Activity(), SensorEventListener {
         lastGyroTs = now
 
         val rawH = -(e.values[2] + e.values[1])
-        val rawV = e.values[0] // Corrected: tilt up = cursor up, tilt down = cursor down
+        val rawV = (if (invertY) 1f else -1f) * e.values[0]
 
         // Dynamic auto-zero bias rejection:
         // Adaptively cancels slow hardware creep when steady
@@ -870,7 +887,7 @@ class MainActivity : Activity(), SensorEventListener {
         if (abs(dYaw) > 0.0003f || abs(dPitch) > 0.0003f) {
             val mult = gyroPxPerRad * currentSensitivity * 0.85f
             val dx = (-dYaw * mult).toDouble()
-            val dy = (dPitch * mult).toDouble()
+            val dy = ((if (invertY) 1f else -1f) * -dPitch * mult).toDouble()
 
             lastSentDx = dx.toFloat()
             lastSentDy = dy.toFloat()
