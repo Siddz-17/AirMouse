@@ -121,6 +121,9 @@ class OTAHandler(SimpleHTTPRequestHandler):
 
         self.send_error(404, "Not Found")
 
+    def do_HEAD(self):
+        self.do_GET()
+
     def log_message(self, format, *args):
         # suppress default verbose GET logging
         pass
