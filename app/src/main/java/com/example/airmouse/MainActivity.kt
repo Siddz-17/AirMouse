@@ -84,8 +84,8 @@ class OneEuroFilter(
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        const val APP_VERSION_CODE = 3
-        const val APP_VERSION_NAME = "2.1"
+        const val APP_VERSION_CODE = 4
+        const val APP_VERSION_NAME = "2.2"
     }
 
     // Motion Tuning
@@ -105,8 +105,8 @@ class MainActivity : Activity(), SensorEventListener {
     private var ws: WebSocket? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private val ui = Handler(Looper.getMainLooper())
-    private lateinit var sm: SensorManager
-    private lateinit var vibrator: Vibrator
+    private var sm: SensorManager? = null
+    private var vibrator: Vibrator? = null
 
     // UI Elements (Nothing Phone Aesthetic)
     private lateinit var statusText: TextView
@@ -132,15 +132,34 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        sm = getSystemService(SENSOR_SERVICE) as SensorManager
-
-        vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            (getSystemService(VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            getSystemService(VIBRATOR_SERVICE) as Vibrator
+        try {
+            initApp()
+        } catch (e: Throwable) {
+            // Failsafe crash display to ensure app NEVER silently closes
+            val errView = TextView(this).apply {
+                text = "STARTUP ERROR:\n${e.javaClass.simpleName}: ${e.message}\n\n${e.stackTraceToString()}"
+                setTextColor(Color.RED)
+                textSize = 12f
+                setPadding(40, 60, 40, 40)
+                setBackgroundColor(Color.BLACK)
+            }
+            setContentView(errView)
         }
+    }
+
+    private fun initApp() {
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Safe SensorManager retrieval
+        try {
+            sm = getSystemService(SENSOR_SERVICE) as? SensorManager
+        } catch (_: Exception) {}
+
+        // Safe Vibrator retrieval (compatible with ALL Android versions)
+        try {
+            @Suppress("DEPRECATION")
+            vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
+        } catch (_: Exception) {}
 
         val prefs = getSharedPreferences("air_nothing", MODE_PRIVATE)
         currentSensitivity = prefs.getFloat("sensitivity", 1.0f)
@@ -258,7 +277,7 @@ class MainActivity : Activity(), SensorEventListener {
 
         val ipCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            padding(16)
+            setPadding(dp(16), dp(16), dp(16), dp(16))
             background = nothingCard(Color.parseColor("#141414"), Color.parseColor("#2B2B2B"), dp(20))
             layoutParams = LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
@@ -365,7 +384,7 @@ class MainActivity : Activity(), SensorEventListener {
         // Minimalist Sensitivity Widget (Nothing Style)
         val sliderCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            padding(12)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             background = nothingCard(Color.parseColor("#111111"), Color.parseColor("#222222"), dp(16))
             layoutParams = LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 topMargin = dp(8)
@@ -620,15 +639,17 @@ class MainActivity : Activity(), SensorEventListener {
     // ==========================================
     private fun acquireWifiLock() {
         try {
-            val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-            wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "AirMouse:LowLatency")
-            } else {
-                @Suppress("DEPRECATION")
-                wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "AirMouse:HighPerf")
+            val wm = applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager
+            if (wm != null) {
+                wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "AirMouse:LowLatency")
+                } else {
+                    @Suppress("DEPRECATION")
+                    wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "AirMouse:HighPerf")
+                }
+                wifiLock?.setReferenceCounted(false)
+                wifiLock?.acquire()
             }
-            wifiLock?.setReferenceCounted(false)
-            wifiLock?.acquire()
         } catch (_: Exception) {}
     }
 
@@ -846,20 +867,35 @@ class MainActivity : Activity(), SensorEventListener {
 
     override fun onResume() {
         super.onResume()
-        // Register sensor at FASTEST possible hardware rate (~200Hz)
-        sm.registerListener(this, sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE), SensorManager.SENSOR_DELAY_FASTEST)
+        try {
+            val sensorManager = sm
+            val gyro = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+            if (sensorManager != null && gyro != null) {
+                sensorManager.registerListener(this, gyro, SensorManager.SENSOR_DELAY_FASTEST)
+            } else {
+                // If device lacks gyroscope, safely auto-fallback to Touchpad mode
+                if (!isTouchpadMode) {
+                    switchMode(true)
+                    modeBadge.text = "• NO GYRO SENSOR - TOUCHPAD ACTIVE"
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     override fun onPause() {
         super.onPause()
-        sm.unregisterListener(this)
-        releaseWifiLock()
+        try {
+            sm?.unregisterListener(this)
+            releaseWifiLock()
+        } catch (_: Exception) {}
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        ws?.close(1000, null)
-        releaseWifiLock()
+        try {
+            ws?.close(1000, null)
+            releaseWifiLock()
+        } catch (_: Exception) {}
     }
 
     // ==========================================
@@ -909,15 +945,16 @@ class MainActivity : Activity(), SensorEventListener {
 
     private fun haptic(ms: Long = 18) {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
-            } else {
-                @Suppress("DEPRECATION")
-                vibrator.vibrate(ms)
+            vibrator?.let { v ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    v.vibrate(ms)
+                }
             }
         } catch (_: Exception) {}
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-    private fun LinearLayout.padding(allDp: Int) = setPadding(dp(allDp), dp(allDp), dp(allDp), dp(allDp))
 }

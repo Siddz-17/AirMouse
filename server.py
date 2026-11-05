@@ -8,8 +8,8 @@ import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import websockets
 
-CURRENT_VERSION_CODE = 3
-CURRENT_VERSION_NAME = "2.1"
+CURRENT_VERSION_CODE = 4
+CURRENT_VERSION_NAME = "2.2"
 
 # Ensure unbuffered console output
 sys.stdout.reconfigure(line_buffering=True)
